@@ -36,6 +36,12 @@ jobs:
       - run: cargo clippy --workspace -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --release --workspace
+      - name: check-release
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/check-release.ps1 target/release
+      - name: test-check-release
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/test-check-release.ps1
       - uses: actions/upload-artifact@v4
         with:
           name: tmpclean-windows-x64
