@@ -1,7 +1,7 @@
 //! Deletion engine for tmpclean.
 
 #[cfg(windows)]
-mod win;
+pub mod win;
 
 pub mod engine;
 pub mod fs;

@@ -1,1 +1,5 @@
-//! Windows platform implementation. Filled in by later todos.
+//! Windows filesystem operations anchored to owned, no-follow handles.
+
+mod fs;
+
+pub use fs::{WinFs, WinHandle};
