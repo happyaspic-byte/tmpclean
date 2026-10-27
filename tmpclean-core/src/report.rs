@@ -469,7 +469,7 @@ impl CancelToken {
 
     pub fn cancel(&self) {
         self.inner.flag.store(true, Ordering::SeqCst);
-        let _guard = self.inner.lock.lock().unwrap();
+        let _guard = self.inner.lock.lock().unwrap_or_else(|e| e.into_inner());
         self.inner.cond.notify_all();
     }
 
@@ -479,9 +479,13 @@ impl CancelToken {
 
     /// Block until canceled. Returns immediately if already canceled.
     pub fn wait(&self) {
-        let mut guard = self.inner.lock.lock().unwrap();
+        let mut guard = self.inner.lock.lock().unwrap_or_else(|e| e.into_inner());
         while !self.is_canceled() {
-            guard = self.inner.cond.wait(guard).unwrap();
+            guard = self
+                .inner
+                .cond
+                .wait(guard)
+                .unwrap_or_else(|e| e.into_inner());
         }
     }
 
