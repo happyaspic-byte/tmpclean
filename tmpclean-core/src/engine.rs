@@ -23,6 +23,9 @@ use crate::fs::{
 };
 use crate::report::{Clock, CounterDelta, Counters, ErrorRecord, Outcome, MAX_ERRORS};
 
+// ERROR_INVALID_DATA: an internal traversal/completion protocol violation.
+const INVALID_STATE: FsError = FsError::Other(13);
+
 /// Engine inputs; confirmation and surface defaults belong to the policy layer.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Policy {
@@ -42,6 +45,7 @@ pub struct RunResult {
 struct CompletionState {
     pending: AtomicUsize,
     retained: AtomicBool,
+    invalid: AtomicBool,
 }
 
 /// Read-only scheduler view of a directory's outstanding completion references.
@@ -57,6 +61,7 @@ impl Completion {
         Self(Arc::new(CompletionState {
             pending: AtomicUsize::new(1),
             retained: AtomicBool::new(false),
+            invalid: AtomicBool::new(false),
         }))
     }
 
@@ -73,8 +78,18 @@ impl Completion {
     }
 
     fn release(&self) {
-        let previous = self.0.pending.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0);
+        if self
+            .0
+            .pending
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                pending.checked_sub(1)
+            })
+            .is_err()
+        {
+            // Drop cannot return an error; the owning task reports this state.
+            self.0.invalid.store(true, Ordering::Release);
+            self.retain();
+        }
     }
 }
 
@@ -116,8 +131,11 @@ impl<'a, F: FileSystem> OwnedHandle<'a, F> {
         }
     }
 
-    fn get(&self) -> &F::Handle {
-        self.handle.as_ref().expect("task handle already closed")
+    fn get(&self) -> Result<&F::Handle, FsError> {
+        match self.handle.as_ref() {
+            Some(handle) => Ok(handle),
+            None => Err(FsError::Other(6)), // ERROR_INVALID_HANDLE
+        }
     }
 
     fn close(&mut self) {
@@ -134,7 +152,7 @@ impl<F: FileSystem> Drop for OwnedHandle<'_, F> {
 }
 
 /// Moveable unit of work. Dropping it closes its handle and releases references,
-/// including on cancellation. A scheduler must not call `step` after Finished.
+/// including on cancellation. Stepping a finished task reports an invariant error.
 pub struct DirectoryTask<'a, F: FileSystem> {
     handle: OwnedHandle<'a, F>,
     path: PathBuf,
@@ -170,15 +188,24 @@ impl<F: FileSystem> DirectoryTask<'_, F> {
         }
     }
 
-    fn finish(&mut self, retained: bool) {
+    fn finish(&mut self, retained: bool) -> Result<(), FsError> {
         self.end_enumeration();
-        debug_assert_eq!(self.completion.pending(), 0);
+        let invalid =
+            self.completion.pending() != 0 || self.completion.0.invalid.load(Ordering::Acquire);
+        if invalid {
+            self.completion.retain();
+        }
         // In particular, close classic-delete handles before waking the parent.
         self.handle.close();
         if let Some(mut parent) = self.parent.take() {
-            parent.retained = retained;
+            parent.retained = retained || invalid;
         }
         self.finished = true;
+        if invalid {
+            Err(INVALID_STATE)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -230,6 +257,23 @@ impl<F: FileSystem> Step<'_, F> {
         self.error = Some(record);
         retained
     }
+
+    fn finish(
+        &mut self,
+        task: &mut DirectoryTask<'_, F>,
+        mut retained: bool,
+        mut outcome: Option<Outcome>,
+    ) {
+        if let Err(error) = task.finish(retained) {
+            // Preserve an operation error already recorded for this entry.
+            if self.error.is_none() {
+                self.record_error(&task.path, error);
+            }
+            retained = true;
+            outcome = task.is_root().then_some(Outcome::FailedToEnumerate);
+        }
+        self.status = StepStatus::Finished { retained, outcome };
+    }
 }
 
 pub struct Engine<'a, F: FileSystem> {
@@ -269,12 +313,33 @@ impl<'a, F: FileSystem> Engine<'a, F> {
     /// Serial explicit-stack postorder driver; there is no recursive traversal
     /// or recursive parent destruction, even for very deep trees.
     pub fn run(&self, root: F::Handle, path: impl Into<PathBuf>) -> RunResult {
-        let mut stack = vec![self.root_task(root, path)];
+        let path = path.into();
+        let mut stack = vec![self.root_task(root, path.clone())];
         let mut counters = Counters::default();
         let mut errors = Vec::new();
         let mut errors_truncated = false;
         loop {
-            let step = self.step(stack.last_mut().expect("root still pending"));
+            let mut step = Step::new();
+            match stack.last_mut() {
+                Some(task) => {
+                    step = self.step(task);
+                    if step.status == StepStatus::Waiting {
+                        // The serial driver has no outstanding worker to await.
+                        step.record_error(&task.path, INVALID_STATE);
+                        step.status = StepStatus::Finished {
+                            retained: true,
+                            outcome: Some(Outcome::FailedToEnumerate),
+                        };
+                    }
+                }
+                None => {
+                    step.record_error(&path, INVALID_STATE);
+                    step.status = StepStatus::Finished {
+                        retained: true,
+                        outcome: Some(Outcome::FailedToEnumerate),
+                    };
+                }
+            }
             counters.merge(&step.delta);
             if let Some(error) = step.error {
                 if errors.len() < MAX_ERRORS {
@@ -286,19 +351,15 @@ impl<'a, F: FileSystem> Engine<'a, F> {
             if let Some(child) = step.child {
                 stack.push(child);
             }
-            match step.status {
-                StepStatus::Continue => {}
-                StepStatus::Waiting => unreachable!("serial children finish before their parent"),
-                StepStatus::Finished { outcome, .. } => {
-                    stack.pop();
-                    if let Some(outcome) = outcome {
-                        return RunResult {
-                            outcome,
-                            counters,
-                            errors,
-                            errors_truncated,
-                        };
-                    }
+            if let StepStatus::Finished { outcome, .. } = step.status {
+                stack.pop();
+                if let Some(outcome) = outcome {
+                    return RunResult {
+                        outcome,
+                        counters,
+                        errors,
+                        errors_truncated,
+                    };
                 }
             }
         }
@@ -307,22 +368,39 @@ impl<'a, F: FileSystem> Engine<'a, F> {
     /// Processes at most one child name or completes the directory. The caller
     /// owns `task` exclusively; child tasks can run on different workers.
     pub fn step(&self, task: &mut DirectoryTask<'a, F>) -> Step<'a, F> {
-        assert!(!task.finished, "cannot step a finished directory");
         let mut step = Step::new();
+        if task.finished || task.completion.0.invalid.load(Ordering::Acquire) {
+            step.record_error(&task.path, INVALID_STATE);
+            let outcome = task.is_root().then_some(Outcome::FailedToEnumerate);
+            step.finish(task, true, outcome);
+            return step;
+        }
         if task.enumerating {
             if task.entries.is_none() {
-                match self.fs.enumerate(task.handle.get()) {
+                match task
+                    .handle
+                    .get()
+                    .and_then(|handle| self.fs.enumerate(handle))
+                {
                     Ok(entries) => task.entries = Some(entries.into_iter()),
                     Err(error) => {
                         let retained = step.record_error(&task.path, error);
                         let outcome = task.is_root().then_some(Outcome::FailedToEnumerate);
-                        task.finish(retained);
-                        step.status = StepStatus::Finished { retained, outcome };
+                        step.finish(task, retained, outcome);
                         return step;
                     }
                 }
             }
-            if let Some(entry) = task.entries.as_mut().unwrap().next() {
+            let entry = match task.entries.as_mut() {
+                Some(entries) => entries.next(),
+                None => {
+                    step.record_error(&task.path, INVALID_STATE);
+                    let outcome = task.is_root().then_some(Outcome::FailedToEnumerate);
+                    step.finish(task, true, outcome);
+                    return step;
+                }
+            };
+            if let Some(entry) = entry {
                 self.child(task, entry, &mut step);
                 return step;
             }
@@ -333,36 +411,44 @@ impl<'a, F: FileSystem> Engine<'a, F> {
             return step;
         }
         let mut retained = task.completion.retained();
-        let outcome = if task.is_root() {
-            // This fresh enumeration, not counters or the initial snapshot,
-            // determines whether the pinned root is actually empty.
-            Some(match self.fs.enumerate(task.handle.get()) {
-                Ok(entries) => Outcome::Completed {
-                    fully_empty: entries.is_empty(),
-                },
-                Err(error) => {
-                    retained |= step.record_error(&task.path, error);
-                    Outcome::FailedToEnumerate
+        let outcome =
+            match task.info.as_ref() {
+                None => {
+                    // This fresh enumeration, not counters or the initial snapshot,
+                    // determines whether the pinned root is actually empty.
+                    let entries = task
+                        .handle
+                        .get()
+                        .and_then(|handle| self.fs.enumerate(handle));
+                    Some(match entries {
+                        Ok(entries) => Outcome::Completed {
+                            fully_empty: entries.is_empty(),
+                        },
+                        Err(error) => {
+                            retained |= step.record_error(&task.path, error);
+                            Outcome::FailedToEnumerate
+                        }
+                    })
                 }
-            })
-        } else {
-            if !retained {
-                let info = task.info.as_ref().unwrap();
-                match self.remove(task.handle.get(), info, &mut task.readonly_cleared) {
-                    Ok(classic) => count_removed(&mut step.delta, info, classic),
-                    Err(FsError::DirectoryNotEmpty) if task.rescans < 2 => {
-                        task.rescans += 1;
-                        task.enumerating = true;
-                        task.completion.0.pending.fetch_add(1, Ordering::AcqRel);
-                        return step;
+                Some(info) => {
+                    if !retained {
+                        match task.handle.get().and_then(|handle| {
+                            self.remove(handle, info, &mut task.readonly_cleared)
+                        }) {
+                            Ok(classic) => count_removed(&mut step.delta, info, classic),
+                            Err(FsError::DirectoryNotEmpty) if task.rescans < 2 => {
+                                task.rescans += 1;
+                                task.enumerating = true;
+                                task.completion.0.pending.fetch_add(1, Ordering::AcqRel);
+                                return step;
+                            }
+                            Err(error) => retained |= step.record_error(&task.path, error),
+                        }
                     }
-                    Err(error) => retained |= step.record_error(&task.path, error),
+                    None
                 }
-            }
-            None
-        };
-        task.finish(retained);
-        step.status = StepStatus::Finished { retained, outcome };
+            };
+        step.finish(task, retained, outcome);
         step
     }
 
@@ -370,11 +456,10 @@ impl<'a, F: FileSystem> Engine<'a, F> {
         let path = task.path.join(&entry.name);
         // Hints are deliberately ignored, including for access selection: the
         // opened object can differ from the enumerated one.
-        let handle = match self.fs.open_child_no_follow(
-            task.handle.get(),
-            &entry.name,
-            crate::fs::Access::DIRECTORY,
-        ) {
+        let handle = match task.handle.get().and_then(|parent| {
+            self.fs
+                .open_child_no_follow(parent, &entry.name, crate::fs::Access::DIRECTORY)
+        }) {
             Ok(handle) => OwnedHandle::new(self.fs, handle),
             Err(error) => {
                 if step.record_error(&path, error) {
@@ -383,7 +468,7 @@ impl<'a, F: FileSystem> Engine<'a, F> {
                 return;
             }
         };
-        let info = match self.fs.basic_info(handle.get()) {
+        let info = match handle.get().and_then(|handle| self.fs.basic_info(handle)) {
             Ok(info) => info,
             Err(error) => {
                 if step.record_error(&path, error) {
@@ -409,7 +494,10 @@ impl<'a, F: FileSystem> Engine<'a, F> {
             step.delta.excluded += 1;
             task.completion.retain();
         } else {
-            match self.remove(handle.get(), &info, &mut false) {
+            match handle
+                .get()
+                .and_then(|handle| self.remove(handle, &info, &mut false))
+            {
                 Ok(classic) => count_removed(&mut step.delta, &info, classic),
                 Err(error) => {
                     if step.record_error(&path, error) {

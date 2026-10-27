@@ -1063,3 +1063,81 @@ fn engine_error_records_are_bounded_but_counters_are_exact() {
     assert_eq!(result.errors.len(), MAX_ERRORS);
     assert!(result.errors_truncated);
 }
+
+#[test]
+fn engine_finished_task_reports_error_without_reclosing_handles() {
+    let fs = TrackedFs::default();
+    let engine = Engine::new(&fs, &FixedClock, Policy::default());
+    let mut root = engine.root_task(fs.root(), "/");
+    assert_eq!(
+        engine.step(&mut root).status,
+        StepStatus::Finished {
+            retained: false,
+            outcome: Some(Outcome::Completed { fully_empty: true })
+        }
+    );
+    let step = engine.step(&mut root);
+    assert_eq!(step.delta.failed, 1);
+    assert_eq!(step.error.unwrap().code, 13);
+    assert_eq!(
+        step.status,
+        StepStatus::Finished {
+            retained: true,
+            outcome: Some(Outcome::FailedToEnumerate)
+        }
+    );
+    assert_eq!(root.completion().pending(), 0);
+    fs.assert_balanced();
+}
+
+#[test]
+fn engine_missing_handle_reports_invalid_handle() {
+    let fs = TrackedFs::default();
+    fs.file("untouched", sized(1));
+    let engine = Engine::new(&fs, &FixedClock, Policy::default());
+    let mut root = engine.root_task(fs.root(), "/");
+    root.handle.close();
+    let step = engine.step(&mut root);
+    assert_eq!(step.delta.failed, 1);
+    assert_eq!(step.error.unwrap().code, 6);
+    assert_eq!(
+        step.status,
+        StepStatus::Finished {
+            retained: true,
+            outcome: Some(Outcome::FailedToEnumerate)
+        }
+    );
+    assert_eq!(fs.fake.stats().disposition_calls, 0);
+    fs.assert_balanced();
+}
+
+#[test]
+fn engine_invalid_completion_reference_reports_error_without_underflow() {
+    let fs = TrackedFs::default();
+    let engine = Engine::new(&fs, &FixedClock, Policy::default());
+    let mut root = engine.root_task(fs.root(), "/");
+    let completion = root.completion();
+    completion.release();
+    completion.release();
+    let step = engine.step(&mut root);
+    assert_eq!(step.delta.failed, 1);
+    assert_eq!(step.error.unwrap().code, 13);
+    assert_eq!(completion.pending(), 0);
+    assert!(completion.retained());
+    fs.assert_balanced();
+}
+
+#[test]
+fn engine_premature_finish_returns_error_and_retains_ancestors() {
+    let fs = TrackedFs::default();
+    fs.dir("child");
+    let engine = Engine::new(&fs, &FixedClock, Policy::default());
+    let mut root = engine.root_task(fs.root(), "/");
+    let child = engine.step(&mut root).child.unwrap();
+    let completion = root.completion();
+    assert_eq!(root.finish(false), Err(FsError::Other(13)));
+    assert!(completion.retained());
+    drop(child);
+    assert_eq!(completion.pending(), 0);
+    fs.assert_balanced();
+}
