@@ -1,0 +1,36 @@
+//! All user-facing English strings for tmpclean.
+//! Keeping them in one table makes a future localization (e.g. Korean)
+//! a one-file change.
+
+pub const APP_NAME: &str = "tmpclean";
+
+// Report / summary labels.
+pub const LABEL_OUTCOME: &str = "Outcome";
+pub const LABEL_FILES_REMOVED: &str = "Files removed";
+pub const LABEL_DIRS_REMOVED: &str = "Directories removed";
+pub const LABEL_LINKS_REMOVED: &str = "Links removed";
+pub const LABEL_CLASSIC_PENDING: &str = "Classic items pending confirmation";
+pub const LABEL_EXCLUDED: &str = "Excluded by policy (min-age)";
+pub const LABEL_SKIPPED_IN_USE: &str = "Skipped (in use)";
+pub const LABEL_FAILED: &str = "Failed";
+pub const LABEL_ABSENT: &str = "Already absent";
+pub const LABEL_CANCELED: &str = "Canceled";
+pub const LABEL_LOGICAL_BYTES_REMOVED: &str = "Logical bytes removed";
+
+// Outcome names.
+pub const OUTCOME_COMPLETED: &str = "completed";
+pub const OUTCOME_COMPLETED_NOT_EMPTY: &str = "completed (not fully empty)";
+pub const OUTCOME_CANCELED: &str = "canceled";
+pub const OUTCOME_FAILED_TO_ENUMERATE: &str = "failed to enumerate";
+
+// Resolve status names (also used in --json targets[].status).
+pub const STATUS_RESOLVED: &str = "resolved";
+pub const STATUS_ABSENT: &str = "absent";
+pub const STATUS_REQUIRES_ELEVATION: &str = "requires-elevation";
+pub const STATUS_REFUSED: &str = "refused";
+pub const STATUS_UNKNOWN_TARGET: &str = "unknown-target";
+
+// Confirmation / cancel messaging.
+pub const CONFIRM_PROMPT: &str = "Proceed with deletion? [y/N]";
+pub const CONFIRM_DECLINED: &str = "Confirmation declined; nothing was deleted.";
+pub const CANCELED_BY_USER: &str = "Canceled by user.";

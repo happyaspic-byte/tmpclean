@@ -304,11 +304,14 @@ fn exclusive_open_reports_sharing_violation_and_keeps_file() {
         names(&fs, &root),
         BTreeSet::from([OsString::from("busy.txt")])
     );
-    assert_eq!(
-        fs.open_child_no_follow(&root, OsStr::new("busy.txt"), Access::DELETE)
-            .unwrap_err(),
-        FsError::SharingViolation
-    );
+    let error = fs
+        .open_child_no_follow(&root, OsStr::new("busy.txt"), Access::DELETE)
+        .unwrap_err();
+    assert_eq!(error, FsError::SharingViolation);
+    let mut counters = tmpclean_core::report::Counters::default();
+    counters.classify(error.code());
+    assert_eq!(counters.skipped_in_use, 1);
+    assert_eq!(counters.failed, 0);
     assert!(path.exists());
     drop(held);
     assert_eq!(fs::read(&path).unwrap(), b"busy");

@@ -523,7 +523,7 @@ fn u32_at(bytes: &[u8], offset: usize) -> Result<u32, FsError> {
     let field = bytes
         .get(offset..offset + 4)
         .ok_or(FsError::from_code(ERROR_INVALID_DATA))?;
-    Ok(u32::from_le_bytes(field.try_into().unwrap()))
+    Ok(u32::from_le_bytes([field[0], field[1], field[2], field[3]]))
 }
 
 fn append_entries(bytes: &[u8], extended: bool, entries: &mut Vec<Entry>) -> Result<(), FsError> {
