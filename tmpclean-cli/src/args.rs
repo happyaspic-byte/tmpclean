@@ -5,14 +5,14 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use tmpclean_core::resolve::Target;
+use tmpclean_core::strings;
 
-/// Fast, safe Windows temp folder cleaner.
 #[derive(Debug, Parser)]
-#[command(name = "tmpclean", version = tmpclean_core::VERSION, about)]
+#[command(name = "tmpclean", version = tmpclean_core::VERSION, about = strings::CLI_ABOUT)]
 pub struct Cli {
-    /// Comma-separated targets to clean.
     #[arg(
         long,
+        help = strings::CLI_HELP_TARGETS,
         value_enum,
         value_delimiter = ',',
         value_name = "LIST",
@@ -20,28 +20,33 @@ pub struct Cli {
     )]
     pub targets: Vec<TargetArg>,
 
-    /// Count what would be deleted; delete nothing.
-    #[arg(long)]
+    #[arg(long, help = strings::CLI_HELP_DRY_RUN)]
     pub dry_run: bool,
 
-    /// Confirm deletion without prompting (required when stdin is not a terminal).
-    #[arg(long)]
+    #[arg(long, help = strings::CLI_HELP_YES)]
     pub yes: bool,
 
-    /// Skip files and links changed more recently than DUR (e.g. 0, 90s, 30m, 24h, 7d).
-    #[arg(long, value_name = "DUR", default_value = "24h", value_parser = parse_duration)]
+    #[arg(
+        long,
+        help = strings::CLI_HELP_MIN_AGE,
+        value_name = "DUR",
+        default_value = "24h",
+        value_parser = parse_duration
+    )]
     pub min_age: Duration,
 
-    /// Print only the JSON report (schema v1) to stdout.
-    #[arg(long)]
+    #[arg(long, help = strings::CLI_HELP_JSON)]
     pub json: bool,
 
-    /// Concurrent deletions per physical device (default: chosen per device).
-    #[arg(long, value_name = "N", env = "TMPCLEAN_IO_PERMITS")]
+    #[arg(
+        long,
+        help = strings::CLI_HELP_IO_PERMITS,
+        value_name = "N",
+        env = "TMPCLEAN_IO_PERMITS"
+    )]
     pub io_permits: Option<NonZeroUsize>,
 
-    /// Print scheduler diagnostics to stderr after the run.
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, help = strings::CLI_HELP_STATS)]
     pub stats: bool,
 }
 
@@ -82,31 +87,26 @@ pub fn parse_duration(text: &str) -> Result<Duration, String> {
     if text == "0" {
         return Ok(Duration::ZERO);
     }
-    let unit = text.chars().last().ok_or("empty duration")?;
+    let expected = || format!("`{text}`: {}", strings::DURATION_EXPECTED);
+    let unit = text.chars().last().ok_or(strings::DURATION_EMPTY)?;
     let seconds_per_unit: u64 = match unit {
         's' => 1,
         'm' => 60,
         'h' => 60 * 60,
         'd' => 24 * 60 * 60,
-        _ => {
-            return Err(format!(
-                "`{text}`: expected 0 or a number with s, m, h or d"
-            ))
-        }
+        _ => return Err(expected()),
     };
     let digits = &text[..text.len() - unit.len_utf8()];
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(format!(
-            "`{text}`: expected 0 or a number with s, m, h or d"
-        ));
+        return Err(expected());
     }
     let count: u64 = digits
         .parse()
-        .map_err(|_| format!("`{text}`: number too large"))?;
+        .map_err(|_| format!("`{text}`: {}", strings::DURATION_NUMBER_TOO_LARGE))?;
     count
         .checked_mul(seconds_per_unit)
         .map(Duration::from_secs)
-        .ok_or_else(|| format!("`{text}`: duration too large"))
+        .ok_or_else(|| format!("`{text}`: {}", strings::DURATION_TOO_LARGE))
 }
 
 #[cfg(test)]

@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use tmpclean_core::policy::{ConfirmState, Policy, Refusal};
 use tmpclean_core::report::{
-    format_lines, to_json, CancelToken, Clock, Counters, Outcome, Report, ResolveStatus, Snapshot,
-    TargetReport,
+    format_lines, to_json, to_json_refused, CancelToken, Clock, Counters, Outcome, Report,
+    ResolveStatus, Snapshot, TargetReport,
 };
 use tmpclean_core::resolve::Resolution;
 use tmpclean_core::sched::{Root, Scheduler};
@@ -17,6 +17,7 @@ use tmpclean_core::win::resolve::resolve_targets;
 use tmpclean_core::win::{WinFs, WinHandle};
 
 use crate::args::Cli;
+use crate::status::{combined_status, refusal_report};
 
 /// Errors listed in the text summary; the JSON report carries up to 1000.
 const TEXT_ERROR_LIMIT: usize = 20;
@@ -36,7 +37,6 @@ pub fn run() -> ExitCode {
     let cli = Cli::parse();
     let mut targets = Vec::new();
     let mut roots: Vec<Root<WinHandle>> = Vec::new();
-    let mut blocked = None;
     for (target, resolution) in resolve_targets(&cli.targets()) {
         let status = resolution.status();
         let path = match resolution {
@@ -49,12 +49,10 @@ pub fn run() -> ExitCode {
             }
             Resolution::Refused(reason) => {
                 eprintln!("{}: {} ({reason})", target.as_str(), status.as_str());
-                blocked.get_or_insert(status);
                 String::new()
             }
             Resolution::RequiresElevation => {
                 eprintln!("{}: {}", target.as_str(), status.as_str());
-                blocked.get_or_insert(status);
                 String::new()
             }
             Resolution::Absent => {
@@ -75,7 +73,7 @@ pub fn run() -> ExitCode {
         prompt(&targets)
     } else {
         eprintln!("{}", strings::CONFIRMATION_REQUIRED);
-        return ExitCode::from(3);
+        return refuse(&cli, targets, Refusal::ConfirmationRequired);
     };
     let policy = Policy {
         dry_run: cli.dry_run,
@@ -85,14 +83,12 @@ pub fn run() -> ExitCode {
     };
     if let Err(refusal) = policy.check() {
         eprintln!("{}", strings::CONFIRM_DECLINED);
-        return ExitCode::from(refusal.exit_code());
+        return refuse(&cli, targets, refusal);
     }
 
-    let resolve_status = if !roots.is_empty() {
-        ResolveStatus::Resolved
-    } else {
-        blocked.unwrap_or(ResolveStatus::Absent)
-    };
+    // Runnable targets run; any refused / requires-elevation target still
+    // makes the whole run exit 3 (same rule as the GUI).
+    let resolve_status = combined_status(targets.iter().map(|t| t.status));
     let mut outcome = Outcome::Completed { fully_empty: true };
     let mut counters = Counters::default();
     let mut errors = Vec::new();
@@ -101,7 +97,7 @@ pub fn run() -> ExitCode {
         let cancel = CancelToken::new();
         let on_ctrl_c = cancel.clone();
         if let Err(error) = ctrlc::set_handler(move || on_ctrl_c.cancel()) {
-            eprintln!("warning: Ctrl+C handler unavailable: {error}");
+            eprintln!("{}: {error}", strings::CTRL_C_UNAVAILABLE);
         }
         let fs = WinFs::new();
         let json = cli.json;
@@ -126,7 +122,7 @@ pub fn run() -> ExitCode {
             Ok(result) => result,
             Err(refusal) => {
                 eprintln!("{}", strings::CONFIRM_DECLINED);
-                return ExitCode::from(refusal.exit_code());
+                return refuse(&cli, targets, refusal);
             }
         };
         outcome = result.outcome;
@@ -151,6 +147,20 @@ pub fn run() -> ExitCode {
     }
     let _ = io::stdout().flush();
     ExitCode::from(report.exit_code)
+}
+
+/// Confirmation required/declined: nothing ran. With `--json`, stdout still
+/// carries one schema-v1 document (outcome "refused", zero counters).
+fn refuse(cli: &Cli, targets: Vec<TargetReport>, refusal: Refusal) -> ExitCode {
+    let code = refusal.exit_code();
+    if cli.json {
+        println!(
+            "{}",
+            to_json_refused(&refusal_report(targets, cli.dry_run, code))
+        );
+        let _ = io::stdout().flush();
+    }
+    ExitCode::from(code)
 }
 
 fn prompt(targets: &[TargetReport]) -> ConfirmState {

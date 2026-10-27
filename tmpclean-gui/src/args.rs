@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use tmpclean_core::resolve::Target;
+use tmpclean_core::strings;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum TargetArg {
@@ -75,12 +76,22 @@ pub fn parse_min_age(s: &str) -> Result<Duration, String> {
         Some('d') => (&s[..s.len() - 1], 86_400),
         _ => (s, 1),
     };
-    let n: u64 = digits
-        .parse()
-        .map_err(|_| format!("invalid duration {s:?}: expected e.g. 0, 90s, 30m, 24h, 7d"))?;
+    let n: u64 = digits.parse().map_err(|_| {
+        format!(
+            "{}{s:?}{}",
+            strings::GUI_ARG_DURATION_INVALID_PREFIX,
+            strings::GUI_ARG_DURATION_INVALID_SUFFIX
+        )
+    })?;
     n.checked_mul(scale)
         .map(Duration::from_secs)
-        .ok_or_else(|| format!("duration {s:?} is too large"))
+        .ok_or_else(|| {
+            format!(
+                "{}{s:?}{}",
+                strings::GUI_ARG_DURATION_TOO_LARGE_PREFIX,
+                strings::GUI_ARG_DURATION_TOO_LARGE_SUFFIX
+            )
+        })
 }
 
 #[cfg(test)]
@@ -144,5 +155,13 @@ mod tests {
         for s in ["", "h", "-1h", "1.5h", "1w"] {
             assert!(parse_min_age(s).is_err(), "{s}");
         }
+        assert_eq!(
+            parse_min_age("soon"),
+            Err("invalid duration \"soon\": expected e.g. 0, 90s, 30m, 24h, 7d".into())
+        );
+        assert_eq!(
+            parse_min_age("99999999999999999d"),
+            Err("duration \"99999999999999999d\" is too large".into())
+        );
     }
 }

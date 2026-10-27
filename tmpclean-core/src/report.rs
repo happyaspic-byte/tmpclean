@@ -268,10 +268,21 @@ fn json_str(s: &str) -> String {
 ///   "counters":{..},"errors":[{"path","code","disposition"}],
 ///   "errors_truncated":bool}`
 pub fn to_json(report: &Report) -> String {
+    json_v1(report, report.outcome.as_str())
+}
+
+/// Schema-v1 JSON for a run refused before it started (confirmation
+/// required or declined): identical to [`to_json`] except that `outcome` is
+/// `"refused"`, since no [`Outcome`] occurred.
+pub fn to_json_refused(report: &Report) -> String {
+    json_v1(report, strings::OUTCOME_REFUSED)
+}
+
+fn json_v1(report: &Report, outcome: &str) -> String {
     let c = &report.counters;
     let mut s = String::with_capacity(512);
     s.push_str("{\"schema\":1,\"outcome\":");
-    s.push_str(&json_str(report.outcome.as_str()));
+    s.push_str(&json_str(outcome));
     s.push_str(",\"exit_code\":");
     s.push_str(&report.exit_code.to_string());
     s.push_str(",\"dry_run\":");

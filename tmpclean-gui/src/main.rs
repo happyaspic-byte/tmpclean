@@ -3,6 +3,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 mod args;
+mod machine;
 mod view;
 
 #[cfg(windows)]

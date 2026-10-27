@@ -9,9 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tmpclean_core::policy::{ConfirmState, Policy, Refusal};
-use tmpclean_core::report::{
-    exit_code, CancelToken, Clock, Counters, Outcome, ResolveStatus, Snapshot,
-};
+use tmpclean_core::report::{CancelToken, Clock, Snapshot};
 use tmpclean_core::resolve::Resolution;
 use tmpclean_core::sched::{Root, Scheduler};
 use tmpclean_core::strings;
@@ -19,6 +17,7 @@ use tmpclean_core::win::resolve::resolve_targets;
 use tmpclean_core::win::{WinFs, WinHandle};
 
 use crate::args::Cli;
+use crate::machine::{self, Completion};
 use crate::view::{self, TargetLine};
 use crate::win32::{self, Event, Ui};
 
@@ -42,7 +41,9 @@ fn take<T>(slot: &Slot<T>) -> Option<T> {
 struct Worker {
     cancel: CancelToken,
     latest: Slot<Snapshot>,
-    finished: Slot<Result<(Outcome, Counters), Refusal>>,
+    /// Set once, after the last `latest` publication; carries the final
+    /// snapshot so the Done view never depends on the read order.
+    finished: Slot<Completion>,
 }
 
 fn start(roots: Vec<Root<WinHandle>>, policy: Policy) -> Worker {
@@ -59,10 +60,20 @@ fn start(roots: Vec<Root<WinHandle>>, policy: Policy) -> Worker {
     thread::spawn(move || {
         let fs = WinFs::new();
         let result = Scheduler::new(&fs, SystemClock, policy).map(|mut scheduler| {
+            let mut last = None;
             let run = scheduler.run(roots, &cancel, |snapshot| {
+                last = Some(snapshot);
                 *latest.lock().unwrap_or_else(PoisonError::into_inner) = Some(snapshot);
             });
-            (run.outcome, run.counters)
+            // The scheduler always reports its drained final snapshot last;
+            // the fallback only rebuilds it from the run result.
+            let final_snapshot = last.unwrap_or(Snapshot {
+                counters: run.counters,
+                errors_recorded: run.errors.len() as u64,
+                errors_truncated: run.errors_truncated,
+                sequence: 0,
+            });
+            (run.outcome, final_snapshot)
         });
         *finished.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
     });
@@ -156,25 +167,21 @@ pub fn run(cli: &Cli) -> u8 {
                 State::Running(w)
             }
             (State::Running(w), Event::Tick) => {
-                if let Some(snapshot) = take(&w.latest) {
-                    ui.set_counters(&view::counters_text(&snapshot, cli.dry_run));
+                let latest = take(&w.latest);
+                let finished = take(&w.finished);
+                let tick = machine::running_tick(latest, finished, resolve_status, cli.dry_run);
+                if let Some(counters) = &tick.counters {
+                    ui.set_counters(counters);
                 }
-                match take(&w.finished) {
+                match tick.done {
                     None => State::Running(w),
-                    Some(result) => {
-                        let (code, outcome) = match result {
-                            Ok((outcome, counters)) => (
-                                exit_code(outcome, &counters, resolve_status, cli.dry_run),
-                                view::outcome_text(outcome),
-                            ),
-                            Err(refusal) => (refusal.exit_code(), ResolveStatus::Refused.as_str()),
-                        };
-                        ui.set_status(&view::done_text(outcome, code));
+                    Some(done) => {
+                        ui.set_status(&done.status);
                         ui.progress_full();
                         ui.set_cancel_enabled(false);
                         ui.enable_close();
                         ui.set_title(strings::GUI_TITLE_DONE);
-                        State::Done(code)
+                        State::Done(done.code)
                     }
                 }
             }
