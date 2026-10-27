@@ -6,5 +6,7 @@ use clap::Parser;
 struct Cli {}
 
 fn main() {
+    #[cfg(windows)]
+    tmpclean_core::win::harden();
     let _cli = Cli::parse();
 }

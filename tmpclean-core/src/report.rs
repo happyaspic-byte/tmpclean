@@ -8,7 +8,7 @@
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::strings;
 
@@ -487,12 +487,25 @@ impl CancelToken {
 
     /// Block until canceled or `timeout` elapses. Returns `true` if canceled.
     pub fn wait_timeout(&self, timeout: Duration) -> bool {
-        let mut guard = self.inner.lock.lock().unwrap();
-        while !self.is_canceled() {
-            let (g, _timed_out) = self.inner.cond.wait_timeout(guard, timeout).unwrap();
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.inner.lock.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if self.is_canceled() {
+                return true;
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let (g, timed_out) = self
+                .inner
+                .cond
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(|e| e.into_inner());
             guard = g;
+            if timed_out.timed_out() && !self.is_canceled() {
+                return false;
+            }
         }
-        true
     }
 }
 
@@ -899,6 +912,49 @@ mod tests {
         h.join().unwrap();
         assert!(woke.load(AOrd::SeqCst));
         assert!(token.is_canceled());
+    }
+
+    #[test]
+    fn wait_timeout_returns_false_on_timeout() {
+        // Bounded guard: a regression that never returns FAILS instead of hanging.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let token = CancelToken::new();
+            let r = token.wait_timeout(Duration::from_millis(20));
+            let _ = tx.send(r);
+        });
+        let r = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("wait_timeout did not return within 2 s guard");
+        assert!(!r);
+    }
+
+    #[test]
+    fn wait_timeout_returns_true_on_cancel() {
+        let token = CancelToken::new();
+        let t2 = token.clone();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let b2 = barrier.clone();
+        let h = std::thread::spawn(move || {
+            b2.wait();
+            t2.cancel();
+        });
+        barrier.wait();
+        let start = Instant::now();
+        let r = token.wait_timeout(Duration::from_secs(5));
+        h.join().unwrap();
+        assert!(r);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "cancel should wake well before the timeout"
+        );
+    }
+
+    #[test]
+    fn wait_timeout_returns_true_when_already_canceled() {
+        let token = CancelToken::new();
+        token.cancel();
+        assert!(token.wait_timeout(Duration::from_secs(5)));
     }
 
     #[test]
