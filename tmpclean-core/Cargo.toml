@@ -1,0 +1,10 @@
+[package]
+name = "tmpclean-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deletion engine for tmpclean"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

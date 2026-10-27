@@ -1,0 +1,22 @@
+[package]
+name = "tmpclean-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Fast, safe Windows temp folder cleaner (GUI)"
+build = "build.rs"
+
+[[bin]]
+name = "tmpclean-gui"
+path = "src/main.rs"
+
+[dependencies]
+tmpclean-core.workspace = true
+clap.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[build-dependencies]
+embed-manifest.workspace = true

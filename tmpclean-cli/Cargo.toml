@@ -1,0 +1,19 @@
+[package]
+name = "tmpclean-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Fast, safe Windows temp folder cleaner (CLI)"
+build = "build.rs"
+
+[[bin]]
+name = "tmpclean"
+path = "src/main.rs"
+
+[dependencies]
+tmpclean-core.workspace = true
+clap.workspace = true
+
+[build-dependencies]
+embed-manifest.workspace = true
