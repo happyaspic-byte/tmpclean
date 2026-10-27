@@ -3,6 +3,8 @@
 #[cfg(windows)]
 mod win;
 
+pub mod fs;
+
 /// Crate version, exposed for the binaries.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
