@@ -42,6 +42,18 @@ jobs:
       - name: test-check-release
         shell: pwsh
         run: pwsh -NoProfile -File scripts/test-check-release.ps1
+      # --- todo 10: GUI end-to-end (UI Automation) ---
+      - name: e2e-gui
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/e2e-gui.ps1 target\release\tmpclean-gui.exe
+      - name: upload GUI screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: task-10-gui
+          path: ${{ runner.temp }}/task-10-gui.png
+          if-no-files-found: error
+      # --- end todo 10 ---
       - uses: actions/upload-artifact@v4
         with:
           name: tmpclean-windows-x64

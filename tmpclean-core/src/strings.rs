@@ -4,6 +4,23 @@
 
 pub const APP_NAME: &str = "tmpclean";
 
+// GUI window (tmpclean-gui). The done title is an observable test signal.
+pub const GUI_TITLE: &str = "tmpclean";
+pub const GUI_TITLE_DONE: &str = "tmpclean - done";
+pub const GUI_BUTTON_CANCEL: &str = "Cancel";
+pub const GUI_BUTTON_CLOSE: &str = "Close";
+pub const GUI_TARGETS: &str = "Targets";
+pub const GUI_COUNTDOWN_PREFIX: &str = "Starting in ";
+pub const GUI_COUNTDOWN_SUFFIX: &str = " s - Enter: start now, Esc: cancel";
+pub const GUI_RUNNING: &str = "Cleaning...";
+pub const GUI_RUNNING_DRY: &str = "Dry run: counting what would be removed...";
+pub const GUI_CANCELING: &str = "Canceling...";
+pub const GUI_DONE_PREFIX: &str = "Done";
+pub const GUI_EXIT_CODE: &str = "exit code";
+pub const GUI_DRY_RUN_NOTE: &str = "Dry run: counters are would-remove totals.";
+pub const GUI_WINDOW_FAILED: &str = "Unable to create the tmpclean window.";
+pub const GUI_WINDOWS_ONLY: &str = "tmpclean-gui runs only on Windows.";
+
 // Report / summary labels.
 pub const LABEL_OUTCOME: &str = "Outcome";
 pub const LABEL_FILES_REMOVED: &str = "Files removed";
