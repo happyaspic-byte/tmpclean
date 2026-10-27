@@ -7,4 +7,11 @@ repository.workspace = true
 description = "Deletion engine for tmpclean"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true
+windows-sys = { workspace = true, features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_Ioctl",
+    "Win32_System_Kernel",
+    "Win32_System_SystemServices",
+] }
