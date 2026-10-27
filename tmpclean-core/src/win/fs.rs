@@ -1,4 +1,7 @@
-use crate::fs::{Access, BasicInfo, DispFlags, Entry, FileSystem, FsError, ReparseTag, VolumeCaps};
+use crate::fs::{
+    Access, BasicInfo, DispFlags, Entry, EntryBatch, FileSystem, FsError, ReparseTag, VolumeCaps,
+    ENUM_BATCH_SIZE,
+};
 use std::cell::{Cell, RefCell};
 use std::ffi::{OsStr, OsString};
 use std::mem::{offset_of, size_of, size_of_val, MaybeUninit};
@@ -38,6 +41,25 @@ pub struct WinHandle {
     access: Access,
     enumeration: RefCell<Vec<u64>>,
     disposition: Cell<Option<DispFlags>>,
+}
+
+/// Position in the handle's reusable native buffer and native enumeration.
+pub struct WinCursor {
+    started: bool,
+    done: bool,
+    extended: bool,
+    offset: Option<usize>,
+}
+
+impl Default for WinCursor {
+    fn default() -> Self {
+        Self {
+            started: false,
+            done: false,
+            extended: true,
+            offset: None,
+        }
+    }
 }
 
 impl AsRawHandle for WinHandle {
@@ -312,6 +334,7 @@ impl WinFs {
 
 impl FileSystem for WinFs {
     type Handle = WinHandle;
+    type Cursor = WinCursor;
 
     fn open_child_no_follow(
         &self,
@@ -339,7 +362,14 @@ impl FileSystem for WinFs {
         Self::open_native(parent.as_raw_handle(), &mut name, access)
     }
 
-    fn enumerate(&self, directory: &WinHandle) -> Result<Vec<Entry>, FsError> {
+    fn enumerate_batch(
+        &self,
+        directory: &WinHandle,
+        cursor: &mut WinCursor,
+    ) -> Result<EntryBatch, FsError> {
+        if cursor.done {
+            return Ok(EntryBatch::new(Vec::new()));
+        }
         if !directory.access.list_directory {
             return Err(FsError::AccessDenied);
         }
@@ -353,10 +383,20 @@ impl FileSystem for WinFs {
         let mut storage = directory.enumeration.borrow_mut();
         storage.resize(ENUM_BYTES / 8, 0);
         let mut entries = Vec::new();
-        let mut extended = true;
-        let mut restart = true;
         loop {
-            let class = match (extended, restart) {
+            if cursor.offset.is_some() {
+                append_entries(
+                    buffer_bytes(&storage),
+                    cursor.extended,
+                    &mut entries,
+                    &mut cursor.offset,
+                    ENUM_BATCH_SIZE,
+                )?;
+                if !entries.is_empty() {
+                    return Ok(EntryBatch::new(entries));
+                }
+            }
+            let class = match (cursor.extended, !cursor.started) {
                 (true, true) => FileIdExtdDirectoryRestartInfo,
                 (true, false) => FileIdExtdDirectoryInfo,
                 (false, true) => FileIdBothDirectoryRestartInfo,
@@ -377,18 +417,17 @@ impl FileSystem for WinFs {
             if ok == 0 {
                 let error = last_error();
                 if error.code() == ERROR_NO_MORE_FILES {
-                    return Ok(entries);
+                    cursor.done = true;
+                    return Ok(EntryBatch::new(entries));
                 }
-                if extended && error.code() == ERROR_INVALID_PARAMETER {
-                    extended = false;
-                    restart = true;
-                    entries.clear();
+                if !cursor.started && cursor.extended && error.code() == ERROR_INVALID_PARAMETER {
+                    cursor.extended = false;
                     continue;
                 }
                 return Err(error);
             }
-            append_entries(buffer_bytes(&storage), extended, &mut entries)?;
-            restart = false;
+            cursor.started = true;
+            cursor.offset = Some(0);
         }
     }
 
@@ -526,14 +565,19 @@ fn u32_at(bytes: &[u8], offset: usize) -> Result<u32, FsError> {
     Ok(u32::from_le_bytes([field[0], field[1], field[2], field[3]]))
 }
 
-fn append_entries(bytes: &[u8], extended: bool, entries: &mut Vec<Entry>) -> Result<(), FsError> {
+fn append_entries(
+    bytes: &[u8],
+    extended: bool,
+    entries: &mut Vec<Entry>,
+    position: &mut Option<usize>,
+    limit: usize,
+) -> Result<(), FsError> {
     let name_offset = if extended {
         offset_of!(FILE_ID_EXTD_DIR_INFO, FileName)
     } else {
         offset_of!(FILE_ID_BOTH_DIR_INFO, FileName)
     };
-    let mut offset = 0;
-    loop {
+    while let Some(offset) = *position {
         let rest = bytes
             .get(offset..)
             .ok_or(FsError::from_code(ERROR_INVALID_DATA))?;
@@ -579,11 +623,12 @@ fn append_entries(bytes: &[u8], extended: bool, entries: &mut Vec<Entry>) -> Res
                 reparse_tag_hint,
             });
         }
-        if next == 0 {
+        *position = if next == 0 { None } else { Some(offset + next) };
+        if entries.len() >= limit {
             return Ok(());
         }
-        offset += next;
     }
+    Ok(())
 }
 
 fn tag_hint(tag: u32, attributes: u32) -> ReparseTag {
@@ -697,7 +742,14 @@ mod tests {
                 bytes.extend(record);
             }
             let mut entries = Vec::new();
-            append_entries(&bytes, extended, &mut entries).unwrap();
+            append_entries(
+                &bytes,
+                extended,
+                &mut entries,
+                &mut Some(0),
+                ENUM_BATCH_SIZE,
+            )
+            .unwrap();
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].name, "file-\u{1f680}");
         }

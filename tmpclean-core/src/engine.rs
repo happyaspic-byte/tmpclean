@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use crate::fs::{
-    BasicInfo, DispFlags, Entry, FileSystem, FsError, DIRECTORY, READONLY, REPARSE_POINT,
+    BasicInfo, DispFlags, Entry, EntryBatch, FileSystem, FsError, DIRECTORY, READONLY,
+    REPARSE_POINT,
 };
 use crate::report::{Clock, CounterDelta, Counters, ErrorRecord, Outcome, MAX_ERRORS};
 
@@ -158,7 +159,9 @@ pub struct DirectoryTask<'a, F: FileSystem> {
     path: PathBuf,
     // None means the pinned root: it has no disposition path.
     info: Option<BasicInfo>,
-    entries: Option<std::vec::IntoIter<Entry>>,
+    entries: Option<EntryBatch>,
+    cursor: F::Cursor,
+    enumeration_failed: bool,
     enumerating: bool,
     completion: Completion,
     parent: Option<ParentRef>,
@@ -301,6 +304,8 @@ impl<'a, F: FileSystem> Engine<'a, F> {
             path: path.into(),
             info: None,
             entries: None,
+            cursor: F::Cursor::default(),
+            enumeration_failed: false,
             enumerating: true,
             completion: Completion::new(),
             parent: None,
@@ -376,29 +381,25 @@ impl<'a, F: FileSystem> Engine<'a, F> {
             return step;
         }
         if task.enumerating {
-            if task.entries.is_none() {
+            if task.entries.as_ref().is_none_or(EntryBatch::is_empty) {
+                task.entries = None;
                 match task
                     .handle
                     .get()
-                    .and_then(|handle| self.fs.enumerate(handle))
+                    .and_then(|handle| self.fs.enumerate_batch(handle, &mut task.cursor))
                 {
-                    Ok(entries) => task.entries = Some(entries.into_iter()),
+                    Ok(entries) => task.entries = Some(entries),
                     Err(error) => {
-                        let retained = step.record_error(&task.path, error);
-                        let outcome = task.is_root().then_some(Outcome::FailedToEnumerate);
-                        step.finish(task, retained, outcome);
-                        return step;
+                        step.record_error(&task.path, error);
+                        task.enumeration_failed = true;
+                        task.completion.retain();
+                        task.end_enumeration();
                     }
                 }
             }
             let entry = match task.entries.as_mut() {
                 Some(entries) => entries.next(),
-                None => {
-                    step.record_error(&task.path, INVALID_STATE);
-                    let outcome = task.is_root().then_some(Outcome::FailedToEnumerate);
-                    step.finish(task, true, outcome);
-                    return step;
-                }
+                None => None,
             };
             if let Some(entry) = entry {
                 self.child(task, entry, &mut step);
@@ -414,12 +415,15 @@ impl<'a, F: FileSystem> Engine<'a, F> {
         let outcome =
             match task.info.as_ref() {
                 None => {
+                    if task.enumeration_failed {
+                        step.finish(task, true, Some(Outcome::FailedToEnumerate));
+                        return step;
+                    }
                     // This fresh enumeration, not counters or the initial snapshot,
                     // determines whether the pinned root is actually empty.
-                    let entries = task
-                        .handle
-                        .get()
-                        .and_then(|handle| self.fs.enumerate(handle));
+                    let entries = task.handle.get().and_then(|handle| {
+                        self.fs.enumerate_batch(handle, &mut F::Cursor::default())
+                    });
                     Some(match entries {
                         Ok(entries) => Outcome::Completed {
                             fully_empty: entries.is_empty(),
@@ -439,6 +443,7 @@ impl<'a, F: FileSystem> Engine<'a, F> {
                             Err(FsError::DirectoryNotEmpty) if task.rescans < 2 => {
                                 task.rescans += 1;
                                 task.enumerating = true;
+                                task.cursor = F::Cursor::default();
                                 task.completion.0.pending.fetch_add(1, Ordering::AcqRel);
                                 return step;
                             }
@@ -483,6 +488,8 @@ impl<'a, F: FileSystem> Engine<'a, F> {
                 path,
                 info: Some(info),
                 entries: None,
+                cursor: F::Cursor::default(),
+                enumeration_failed: false,
                 enumerating: true,
                 completion: Completion::new(),
                 parent: Some(ParentRef::new(&task.completion)),

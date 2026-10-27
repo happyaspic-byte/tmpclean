@@ -89,6 +89,7 @@ impl TrackedFs {
 
 impl FileSystem for TrackedFs {
     type Handle = TrackedHandle;
+    type Cursor = crate::fs::FakeCursor;
 
     fn open_child_no_follow(
         &self,
@@ -101,15 +102,21 @@ impl FileSystem for TrackedFs {
             .map(|raw| self.wrap(raw, parent.path.join(name), false))
     }
 
-    fn enumerate(&self, handle: &TrackedHandle) -> Result<Vec<Entry>, FsError> {
-        self.audit
-            .lock()
-            .unwrap()
-            .enumerations
-            .push(handle.path.clone());
-        let mut entries = self.fake.enumerate(&handle.raw)?;
+    fn enumerate_batch(
+        &self,
+        handle: &TrackedHandle,
+        cursor: &mut Self::Cursor,
+    ) -> Result<EntryBatch, FsError> {
+        if !cursor.started {
+            self.audit
+                .lock()
+                .unwrap()
+                .enumerations
+                .push(handle.path.clone());
+        }
+        let mut entries = self.fake.enumerate_batch(&handle.raw, cursor)?;
         if self.misleading_hints {
-            for entry in &mut entries {
+            for entry in entries.as_mut_slice() {
                 entry.is_dir_hint = !entry.is_dir_hint;
                 entry.reparse_tag_hint = if entry.reparse_tag_hint.is_none() {
                     Some(ReparseTag::Junction)
@@ -1140,4 +1147,58 @@ fn engine_premature_finish_returns_error_and_retains_ancestors() {
     drop(child);
     assert_eq!(completion.pending(), 0);
     fs.assert_balanced();
+}
+
+#[test]
+fn engine_batch_flat_hundred_thousand_is_bounded() {
+    let fs = FakeFs::new();
+    for i in 0..100_000 {
+        fs.close(fs.add_file(format!("file{i:06}"), sized(2)).unwrap());
+    }
+    let result = Engine::new(&fs, &FixedClock, Policy::default()).run(fs.root_handle(), "/");
+    assert_eq!(result.outcome, Outcome::Completed { fully_empty: true });
+    assert_eq!(result.counters.files_removed, 100_000);
+    assert_eq!(result.counters.logical_bytes_removed, 200_000);
+    assert_eq!(result.counters.failed, 0);
+    let stats = fs.stats();
+    assert!(stats.peak_in_flight_entries <= 4096);
+    assert_eq!(stats.in_flight_entries, 0);
+    println!(
+        "100000 entries: {:?}; peak={} live={}",
+        result.counters, stats.peak_in_flight_entries, stats.in_flight_entries
+    );
+}
+
+#[test]
+fn engine_batch_midstream_error_keeps_completed_counts_and_walks_sibling() {
+    let fs = Arc::new(TrackedFs::default());
+    fs.dir("broken");
+    for i in 0..300 {
+        fs.file(format!("broken/file{i:04}"), sized(1));
+    }
+    fs.file("z_sibling", sized(7));
+    let weak = Arc::downgrade(&fs);
+    let calls = AtomicUsize::new(0);
+    fs.fake.set_disposition_hook(Some(Arc::new(move || {
+        if calls.fetch_add(1, Ordering::SeqCst) == 127 {
+            weak.upgrade().unwrap().inject(
+                "broken",
+                Operation::Enumerate,
+                FsError::Other(999),
+                FailureMode::Once,
+            );
+        }
+    })));
+    let result = fs.run(Policy::default());
+    fs.fake.set_disposition_hook(None);
+    assert_eq!(result.outcome, Outcome::Completed { fully_empty: false });
+    assert_eq!(result.counters.files_removed, 129);
+    assert_eq!(result.counters.logical_bytes_removed, 135);
+    assert_eq!(result.counters.failed, 1);
+    assert_eq!(result.errors[0].code, 999);
+    assert_eq!(fs.fake.stats().in_flight_entries, 0);
+    println!(
+        "mid-batch error: {:?}; error={:?}; sibling deleted",
+        result.counters, result.errors
+    );
 }

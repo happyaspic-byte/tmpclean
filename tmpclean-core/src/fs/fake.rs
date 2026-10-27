@@ -35,6 +35,15 @@ pub struct FakeStats {
     pub current_dispositions: usize,
     pub max_concurrent_dispositions: usize,
     pub enumerated_directories: Vec<PathBuf>,
+    pub in_flight_entries: usize,
+    pub peak_in_flight_entries: usize,
+}
+
+#[derive(Default)]
+pub struct FakeCursor {
+    pub(crate) started: bool,
+    after: Option<OsString>,
+    done: bool,
 }
 
 struct Node {
@@ -78,6 +87,7 @@ pub struct FakeFs {
     clear_readonly: AtomicUsize,
     current: AtomicUsize,
     maximum: AtomicUsize,
+    entry_metrics: Arc<EntryMetrics>,
 }
 
 impl Default for FakeFs {
@@ -110,6 +120,7 @@ impl Default for FakeFs {
             clear_readonly: AtomicUsize::new(0),
             current: AtomicUsize::new(0),
             maximum: AtomicUsize::new(0),
+            entry_metrics: Arc::default(),
         }
     }
 }
@@ -343,6 +354,8 @@ impl FakeFs {
             current_dispositions: self.current.load(Ordering::SeqCst),
             max_concurrent_dispositions: self.maximum.load(Ordering::SeqCst),
             enumerated_directories: self.state().enumerated.clone(),
+            in_flight_entries: self.entry_metrics.current.load(Ordering::SeqCst),
+            peak_in_flight_entries: self.entry_metrics.peak.load(Ordering::SeqCst),
         }
     }
 }
@@ -357,6 +370,7 @@ impl Drop for InFlight<'_> {
 
 impl FileSystem for FakeFs {
     type Handle = FakeHandle;
+    type Cursor = FakeCursor;
 
     fn open_child_no_follow(
         &self,
@@ -395,7 +409,14 @@ impl FileSystem for FakeFs {
         Ok(self.handle(&mut state, id, access))
     }
 
-    fn enumerate(&self, directory: &FakeHandle) -> Result<Vec<Entry>, FsError> {
+    fn enumerate_batch(
+        &self,
+        directory: &FakeHandle,
+        cursor: &mut FakeCursor,
+    ) -> Result<EntryBatch, FsError> {
+        if cursor.done {
+            return Ok(EntryBatch::new(Vec::new()));
+        }
         let mut state = self.state();
         let (id, access) = self.node(&state, directory)?;
         let path = state.nodes[&id].path.clone();
@@ -410,9 +431,14 @@ impl FileSystem for FakeFs {
         {
             return Err(FsError::Other(267)); // ERROR_DIRECTORY; never resolves the target
         }
-        let entries = node
+        let start = match &cursor.after {
+            Some(name) => std::ops::Bound::Excluded(name.clone()),
+            None => std::ops::Bound::Unbounded,
+        };
+        let entries: Vec<_> = node
             .children
-            .iter()
+            .range((start, std::ops::Bound::Unbounded))
+            .take(ENUM_BATCH_SIZE)
             .map(|(name, id)| {
                 let info = &state.nodes[id].info;
                 Entry {
@@ -422,8 +448,15 @@ impl FileSystem for FakeFs {
                 }
             })
             .collect();
-        state.enumerated.push(path);
-        Ok(entries)
+        if !cursor.started {
+            state.enumerated.push(path);
+        }
+        cursor.started = true;
+        cursor.done = entries.len() < ENUM_BATCH_SIZE;
+        if let Some(entry) = entries.last() {
+            cursor.after = Some(entry.name.clone());
+        }
+        Ok(EntryBatch::tracked(entries, self.entry_metrics.clone()))
     }
 
     fn basic_info(&self, handle: &FakeHandle) -> Result<BasicInfo, FsError> {

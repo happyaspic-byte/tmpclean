@@ -11,7 +11,8 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tmpclean_core::fs::{
-    Access, DispFlags, FileSystem, FsError, ReparseTag, DIRECTORY, READONLY, REPARSE_POINT,
+    Access, DispFlags, FileSystem, FsError, ReparseTag, DIRECTORY, ENUM_BATCH_SIZE, READONLY,
+    REPARSE_POINT,
 };
 use tmpclean_core::win::{WinFs, WinHandle};
 
@@ -334,6 +335,25 @@ fn enumeration_returns_exact_names_across_multiple_buffers_and_restarts() {
 
     let fs = WinFs::new();
     let root = WinFs::open_root(&dir.0).unwrap();
+    let mut cursor = Default::default();
+    let mut batched = BTreeSet::new();
+    let mut batches = 0;
+    loop {
+        let batch = fs.enumerate_batch(&root, &mut cursor).unwrap();
+        assert!(batch.len() <= ENUM_BATCH_SIZE);
+        if batch.is_empty() {
+            break;
+        }
+        batches += 1;
+        for entry in batch {
+            assert!(
+                batched.insert(entry.name),
+                "no duplicate across continuations"
+            );
+        }
+    }
+    assert!(batches > 1);
+    assert_eq!(batched, expected);
     let entries = fs.enumerate(&root).unwrap();
     assert_eq!(entries.len(), expected.len());
     for entry in entries {
