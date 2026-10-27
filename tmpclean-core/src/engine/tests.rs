@@ -157,6 +157,10 @@ impl FileSystem for TrackedFs {
         self.fake.clear_readonly(&handle.raw)
     }
 
+    fn restore_readonly(&self, handle: &TrackedHandle) -> Result<(), FsError> {
+        self.fake.restore_readonly(&handle.raw)
+    }
+
     fn close(&self, handle: TrackedHandle) {
         self.audit.lock().unwrap().closes += 1;
         self.fake.close(handle.raw);
@@ -704,6 +708,117 @@ fn engine_readonly_clear_retry_preserves_other_attributes() {
 #[test]
 fn engine_readonly_clear_is_attempted_only_once() {
     let fs = TrackedFs::default();
+    let raw = fs
+        .fake
+        .add_file(
+            "readonly",
+            BasicInfo {
+                attributes: READONLY | 0x20,
+                ..sized(1)
+            },
+        )
+        .unwrap();
+    fs.inject(
+        "readonly",
+        Operation::SetDisposition,
+        FsError::AccessDenied,
+        FailureMode::Persistent,
+    );
+    let result = fs.run(confirmed_policy());
+    assert_eq!(result.counters.failed, 1);
+    assert_eq!(result.counters.files_removed, 0);
+    assert_eq!(result.errors.len(), 1);
+    assert_eq!(fs.fake.stats().clear_readonly_calls, 1);
+    assert_eq!(disposition_flags(&fs), vec![POSIX_IGNORE, POSIX_IGNORE]);
+    // The retained file gets its READONLY bit back; other bits are untouched.
+    assert_eq!(fs.fake.stats().restore_readonly_calls, 1);
+    let attributes = fs.fake.basic_info(&raw).unwrap().attributes;
+    assert_ne!(
+        attributes & READONLY,
+        0,
+        "READONLY restored after failed delete"
+    );
+    assert_eq!(attributes, READONLY | 0x20);
+    fs.fake.close(raw);
+    let root = fs.fake.root_handle();
+    assert_eq!(fs.fake.enumerate(&root).unwrap().len(), 1);
+    fs.fake.close(root);
+}
+
+#[test]
+fn engine_readonly_restore_failure_is_recorded_separately() {
+    let fs = TrackedFs::default();
+    let raw = fs
+        .fake
+        .add_file(
+            "readonly",
+            BasicInfo {
+                attributes: READONLY,
+                ..sized(1)
+            },
+        )
+        .unwrap();
+    fs.inject(
+        "readonly",
+        Operation::SetDisposition,
+        FsError::AccessDenied,
+        FailureMode::Persistent,
+    );
+    fs.inject(
+        "readonly",
+        Operation::RestoreReadonly,
+        FsError::Other(4321),
+        FailureMode::Once,
+    );
+    let result = fs.run(confirmed_policy());
+    // One failure for the delete, one for the rollback, each with its record.
+    assert_eq!(result.counters.failed, 2);
+    assert_eq!(result.counters.files_removed, 0);
+    let codes: Vec<_> = result
+        .errors
+        .iter()
+        .map(|e| (e.code, e.path.as_str()))
+        .collect();
+    assert_eq!(codes, vec![(5, "/readonly"), (4321, "/readonly")]);
+    assert_eq!(fs.fake.stats().restore_readonly_calls, 1);
+    assert_eq!(fs.fake.basic_info(&raw).unwrap().attributes & READONLY, 0);
+    fs.fake.close(raw);
+}
+
+#[test]
+fn engine_readonly_directory_restored_when_delete_fails() {
+    let fs = TrackedFs::default();
+    let raw = fs.fake.add_dir("dir").unwrap();
+    fs.fake
+        .set_basic_info(
+            &raw,
+            BasicInfo {
+                attributes: DIRECTORY | READONLY,
+                ..BasicInfo::default()
+            },
+        )
+        .unwrap();
+    fs.inject(
+        "dir",
+        Operation::SetDisposition,
+        FsError::AccessDenied,
+        FailureMode::Persistent,
+    );
+    let result = fs.run(confirmed_policy());
+    assert_eq!(result.counters.failed, 1);
+    assert_eq!(result.counters.dirs_removed, 0);
+    assert_eq!(fs.fake.stats().clear_readonly_calls, 1);
+    assert_eq!(fs.fake.stats().restore_readonly_calls, 1);
+    assert_eq!(
+        fs.fake.basic_info(&raw).unwrap().attributes,
+        DIRECTORY | READONLY
+    );
+    fs.fake.close(raw);
+}
+
+#[test]
+fn engine_readonly_clear_success_is_not_restored() {
+    let fs = TrackedFs::default();
     fs.file(
         "readonly",
         BasicInfo {
@@ -715,12 +830,13 @@ fn engine_readonly_clear_is_attempted_only_once() {
         "readonly",
         Operation::SetDisposition,
         FsError::AccessDenied,
-        FailureMode::Persistent,
+        FailureMode::Once,
     );
     let result = fs.run(confirmed_policy());
-    assert_eq!(result.counters.failed, 1);
+    assert_eq!(result.counters.files_removed, 1);
+    assert_eq!(result.counters.failed, 0);
     assert_eq!(fs.fake.stats().clear_readonly_calls, 1);
-    assert_eq!(disposition_flags(&fs), vec![POSIX_IGNORE, POSIX_IGNORE]);
+    assert_eq!(fs.fake.stats().restore_readonly_calls, 0);
 }
 
 #[test]
@@ -748,7 +864,10 @@ fn engine_readonly_clear_failure_is_recorded_and_closed() {
     let result = fs.run(confirmed_policy());
     assert_eq!(result.counters.failed, 1);
     assert_eq!(result.errors[0].code, 1234);
+    assert_eq!(result.errors.len(), 1);
     assert_eq!(fs.fake.stats().clear_readonly_calls, 1);
+    // Nothing was cleared, so there is nothing to roll back.
+    assert_eq!(fs.fake.stats().restore_readonly_calls, 0);
     assert_eq!(disposition_flags(&fs), vec![POSIX_IGNORE]);
 }
 

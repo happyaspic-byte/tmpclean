@@ -20,6 +20,7 @@ pub enum Operation {
     BasicInfo,
     SetDisposition,
     ClearReadonly,
+    RestoreReadonly,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +33,7 @@ pub enum FailureMode {
 pub struct FakeStats {
     pub disposition_calls: usize,
     pub clear_readonly_calls: usize,
+    pub restore_readonly_calls: usize,
     pub current_dispositions: usize,
     pub max_concurrent_dispositions: usize,
     pub enumerated_directories: Vec<PathBuf>,
@@ -88,6 +90,7 @@ pub struct FakeFs {
     state: Mutex<State>,
     dispositions: AtomicUsize,
     clear_readonly: AtomicUsize,
+    restore_readonly: AtomicUsize,
     current: AtomicUsize,
     maximum: AtomicUsize,
     entry_metrics: Arc<EntryMetrics>,
@@ -123,6 +126,7 @@ impl Default for FakeFs {
             }),
             dispositions: AtomicUsize::new(0),
             clear_readonly: AtomicUsize::new(0),
+            restore_readonly: AtomicUsize::new(0),
             current: AtomicUsize::new(0),
             maximum: AtomicUsize::new(0),
             entry_metrics: Arc::default(),
@@ -368,6 +372,7 @@ impl FakeFs {
         FakeStats {
             disposition_calls: self.dispositions.load(Ordering::SeqCst),
             clear_readonly_calls: self.clear_readonly.load(Ordering::SeqCst),
+            restore_readonly_calls: self.restore_readonly.load(Ordering::SeqCst),
             current_dispositions: self.current.load(Ordering::SeqCst),
             max_concurrent_dispositions: self.maximum.load(Ordering::SeqCst),
             enumerated_directories: state.enumerated.clone(),
@@ -535,6 +540,20 @@ impl FileSystem for FakeFs {
             return Err(FsError::AccessDenied);
         }
         node.info.attributes &= !READONLY;
+        Ok(())
+    }
+
+    fn restore_readonly(&self, handle: &FakeHandle) -> Result<(), FsError> {
+        self.restore_readonly.fetch_add(1, Ordering::SeqCst);
+        let mut state = self.state();
+        let (id, _) = self.node(&state, handle)?;
+        let path = state.nodes[&id].path.clone();
+        Self::check(&mut state, &path, Operation::RestoreReadonly)?;
+        let node = state.nodes.get_mut(&id).ok_or(FsError::NotFound(2))?;
+        if node.denied {
+            return Err(FsError::AccessDenied);
+        }
+        node.info.attributes |= READONLY;
         Ok(())
     }
 

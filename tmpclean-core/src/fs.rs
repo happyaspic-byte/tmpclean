@@ -5,16 +5,23 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+#[cfg(any(test, feature = "test-util"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(any(test, feature = "test-util"))]
 use std::sync::Arc;
 use std::time::SystemTime;
 
+// Test double only: compiled for unit tests or with the `test-util` feature,
+// never into release binaries.
+#[cfg(any(test, feature = "test-util"))]
 mod fake;
+#[cfg(any(test, feature = "test-util"))]
 pub use fake::{FailureMode, FakeCursor, FakeFs, FakeHandle, FakeStats, Operation};
 
 /// A name batch, rather than one task per file. Traversal never collects a directory.
 pub const ENUM_BATCH_SIZE: usize = 128;
 
+#[cfg(any(test, feature = "test-util"))]
 #[derive(Default, Debug)]
 pub(crate) struct EntryMetrics {
     pub current: AtomicUsize,
@@ -26,19 +33,24 @@ pub(crate) struct EntryMetrics {
 #[derive(Debug)]
 pub struct EntryBatch {
     entries: std::vec::IntoIter<Entry>,
+    #[cfg(any(test, feature = "test-util"))]
     metrics: Option<Arc<EntryMetrics>>,
+    #[cfg(any(test, feature = "test-util"))]
     allocated: usize,
 }
 
 impl EntryBatch {
     pub fn new(entries: Vec<Entry>) -> Self {
         Self {
+            #[cfg(any(test, feature = "test-util"))]
             allocated: entries.len(),
             entries: entries.into_iter(),
+            #[cfg(any(test, feature = "test-util"))]
             metrics: None,
         }
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn tracked(entries: Vec<Entry>, metrics: Arc<EntryMetrics>) -> Self {
         let mut batch = Self::new(entries);
         let current =
@@ -71,6 +83,7 @@ impl Iterator for EntryBatch {
 
 impl ExactSizeIterator for EntryBatch {}
 
+#[cfg(any(test, feature = "test-util"))]
 impl Drop for EntryBatch {
     fn drop(&mut self) {
         if let Some(metrics) = &self.metrics {
@@ -242,6 +255,9 @@ pub trait FileSystem: Send + Sync {
     fn basic_info(&self, handle: &Self::Handle) -> Result<BasicInfo, FsError>;
     fn set_disposition(&self, handle: &Self::Handle, flags: DispFlags) -> Result<(), FsError>;
     fn clear_readonly(&self, handle: &Self::Handle) -> Result<(), FsError>;
+    /// Sets READONLY again, preserving every other attribute bit. Rolls back a
+    /// `clear_readonly` whose deletion still failed.
+    fn restore_readonly(&self, handle: &Self::Handle) -> Result<(), FsError>;
     fn close(&self, handle: Self::Handle);
     fn volume_caps(&self, handle: &Self::Handle, query_extents: bool) -> VolumeCaps;
 }

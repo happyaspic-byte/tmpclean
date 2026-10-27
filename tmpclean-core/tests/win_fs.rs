@@ -9,11 +9,14 @@ use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tmpclean_core::engine::Engine;
 use tmpclean_core::fs::{
     Access, DispFlags, FileSystem, FsError, ReparseTag, DIRECTORY, ENUM_BATCH_SIZE, READONLY,
     REPARSE_POINT,
 };
+use tmpclean_core::policy::{ConfirmState, Policy};
+use tmpclean_core::report::Clock;
 use tmpclean_core::win::{WinFs, WinHandle};
 
 const DELETE: DispFlags = DispFlags {
@@ -431,6 +434,109 @@ fn classic_readonly_denial_does_not_retry_or_change_attributes() {
     assert_eq!(fs.disposition_flags(&file), Some(classic));
     fs.close(file);
     assert!(!path.exists());
+}
+
+fn icacls(path: &Path, args: &[&str]) -> io::Result<()> {
+    let output = Command::new("icacls").arg(path).args(args).output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "icacls {} {args:?}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stdout)
+        )))
+    }
+}
+
+/// Removes the Everyone deny ACEs; declared after the TestDir so it drops first.
+struct DenyGuard(Vec<PathBuf>);
+
+impl Drop for DenyGuard {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            if let Err(error) = icacls(path, &["/remove:d", "*S-1-1-0"]) {
+                eprintln!("ACL restore failed: {error}");
+            }
+        }
+    }
+}
+
+struct FixedClock;
+
+impl Clock for FixedClock {
+    fn now(&self) -> Duration {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
+    }
+}
+
+#[test]
+fn delete_denied_readonly_file_stays_readonly_after_failed_delete() {
+    let dir = TestDir::new("denied-readonly");
+    let path = dir.0.join("denied.txt");
+    drop(
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .attributes(0x20)
+            .open(&path)
+            .unwrap(),
+    );
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&path, permissions).unwrap();
+    let before = fs::metadata(&path).unwrap().file_attributes();
+    assert_eq!(before & (READONLY | 0x20), READONLY | 0x20);
+
+    // FILE_DELETE_CHILD on the parent would otherwise override the file's
+    // DELETE deny, so deny both; the guard drops before the fixture.
+    let _guard = DenyGuard(vec![path.clone(), dir.0.clone()]);
+    icacls(&path, &["/deny", "*S-1-1-0:(D)"]).unwrap();
+    icacls(&dir.0, &["/deny", "*S-1-1-0:(DC)"]).unwrap();
+
+    // Engine over the real filesystem: the delete fails, the file is retained
+    // and still read-only.
+    let fs = WinFs::new();
+    let policy = Policy {
+        confirm: ConfirmState::Confirmed,
+        min_age: Duration::ZERO,
+        ..Policy::default()
+    };
+    let result = Engine::new(&fs, &FixedClock, policy)
+        .unwrap()
+        .run(WinFs::open_root(&dir.0).unwrap(), dir.0.clone());
+    assert_eq!(result.counters.failed, 1);
+    assert_eq!(result.counters.files_removed, 0);
+    assert!(path.exists());
+    let after = fs::metadata(&path).unwrap().file_attributes();
+    assert_ne!(after & READONLY, 0, "READONLY must survive a failed delete");
+    assert_eq!(after, before);
+
+    // Handle-level rollback: a handle that may clear READONLY but cannot delete
+    // runs the engine's clear -> failed disposition -> restore sequence.
+    let root = WinFs::open_root(&dir.0).unwrap();
+    assert_eq!(
+        fs.open_child_no_follow(&root, OsStr::new("denied.txt"), Access::DELETE)
+            .err(),
+        Some(FsError::AccessDenied)
+    );
+    let file = fs
+        .open_child_no_follow(&root, OsStr::new("denied.txt"), Access::READ)
+        .unwrap();
+    fs.clear_readonly(&file).unwrap();
+    assert_eq!(fs.basic_info(&file).unwrap().attributes & READONLY, 0);
+    assert_eq!(
+        fs.set_disposition(&file, DELETE),
+        Err(FsError::AccessDenied)
+    );
+    fs.restore_readonly(&file).unwrap();
+    assert_eq!(fs.basic_info(&file).unwrap().attributes, before);
+    fs.close(file);
+    fs.close(root);
+    assert!(path.exists());
+    let after = fs::metadata(&path).unwrap().file_attributes();
+    assert_ne!(after & READONLY, 0, "READONLY restored through the handle");
+    assert_eq!(after, before);
 }
 
 #[test]

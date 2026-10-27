@@ -514,6 +514,18 @@ impl FileSystem for WinFs {
         )
     }
 
+    fn restore_readonly(&self, handle: &WinHandle) -> Result<(), FsError> {
+        let basic = Self::basic(handle)?;
+        if basic.FileAttributes & FILE_ATTRIBUTE_READONLY != 0 {
+            return Ok(());
+        }
+        let writable = Self::writable_attributes(handle)?;
+        set_attributes(
+            writable.as_raw_handle(),
+            with_readonly(basic.FileAttributes),
+        )
+    }
+
     fn close(&self, handle: WinHandle) {
         drop(handle);
     }
@@ -589,6 +601,11 @@ fn without_readonly(attributes: u32) -> u32 {
         0 => FILE_ATTRIBUTE_NORMAL,
         attributes => attributes,
     }
+}
+
+fn with_readonly(attributes: u32) -> u32 {
+    // NORMAL is valid only alone, so it never survives next to READONLY.
+    (attributes & !FILE_ATTRIBUTE_NORMAL) | FILE_ATTRIBUTE_READONLY
 }
 
 fn buffer_bytes(storage: &[u64]) -> &[u8] {

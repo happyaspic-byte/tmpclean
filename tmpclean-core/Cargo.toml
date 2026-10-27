@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 description = "Deletion engine for tmpclean"
 
+[features]
+# Exposes the in-memory FakeFs test double outside this crate's unit tests.
+# Enable only from dev-dependencies; release binaries never compile it.
+test-util = []
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Wdk_Foundation",

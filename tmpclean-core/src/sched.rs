@@ -188,7 +188,7 @@ impl<'a, F: FileSystem, C: Clock> Scheduler<'a, F, C> {
             }
             drop(sender);
             for event in receiver {
-                if let Some(error) = event.error {
+                for error in event.error.into_iter().chain(event.restore_error) {
                     aggregator.record_error();
                     if errors.len() < MAX_ERRORS {
                         errors.push(error);
@@ -273,6 +273,7 @@ struct Pool<'a, F: FileSystem> {
 struct Event {
     delta: CounterDelta,
     error: Option<ErrorRecord>,
+    restore_error: Option<ErrorRecord>,
     outcome: Option<Outcome>,
 }
 
@@ -354,6 +355,7 @@ fn drive<'a, F: FileSystem>(
                     .send(Event {
                         delta: step.delta,
                         error: step.error,
+                        restore_error: step.restore_error,
                         outcome,
                     })
                     .is_err()
@@ -484,6 +486,50 @@ mod tests {
             fs.set_disposition_hook(None);
             (result, scheduler.stats().clone(), fs.stats())
         })
+    }
+
+    #[test]
+    fn sched_reports_readonly_restore_failure_as_its_own_record() {
+        use crate::fs::{FailureMode, FileSystem, FsError, Operation, READONLY};
+        let fs = FakeFs::new();
+        let raw = fs
+            .add_file(
+                "readonly",
+                BasicInfo {
+                    attributes: READONLY,
+                    ..BasicInfo::default()
+                },
+            )
+            .unwrap();
+        fs.inject_failure(
+            "readonly",
+            Operation::SetDisposition,
+            FsError::AccessDenied,
+            FailureMode::Persistent,
+        )
+        .unwrap();
+        fs.inject_failure(
+            "readonly",
+            Operation::RestoreReadonly,
+            FsError::Other(4321),
+            FailureMode::Once,
+        )
+        .unwrap();
+        let mut scheduler = scheduler(&fs, NonZeroUsize::new(2));
+        let result = scheduler.run(
+            vec![Root {
+                handle: fs.root_handle(),
+                path: "/".into(),
+            }],
+            &CancelToken::new(),
+            |_| {},
+        );
+        assert_eq!(result.counters.failed, 2);
+        let codes: Vec<_> = result.errors.iter().map(|e| e.code).collect();
+        assert_eq!(codes, vec![5, 4321]);
+        assert_eq!(fs.stats().restore_readonly_calls, 1);
+        assert_eq!(fs.basic_info(&raw).unwrap().attributes & READONLY, 0);
+        fs.close(raw);
     }
 
     #[test]

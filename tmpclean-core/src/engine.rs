@@ -29,6 +29,16 @@ use crate::report::{Clock, CounterDelta, Counters, ErrorRecord, Outcome, MAX_ERR
 // ERROR_INVALID_DATA: an internal traversal/completion protocol violation.
 const INVALID_STATE: FsError = FsError::Other(13);
 
+/// The one-time READONLY clear before a disposition retry. Only `Cleared`
+/// changed the object, so only it is rolled back when the entry is retained.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ReadonlyRetry {
+    #[default]
+    NotAttempted,
+    ClearFailed,
+    Cleared,
+}
+
 #[derive(Debug)]
 pub struct RunResult {
     pub outcome: Outcome,
@@ -198,7 +208,7 @@ pub struct DirectoryTask<'a, F: FileSystem> {
     completion: Completion,
     parent: Option<ParentRef>,
     rescans: u8,
-    readonly_cleared: bool,
+    readonly: ReadonlyRetry,
     finished: bool,
 }
 
@@ -280,6 +290,8 @@ pub struct Step<'a, F: FileSystem> {
     pub child: Option<DirectoryTask<'a, F>>,
     pub delta: CounterDelta,
     pub error: Option<ErrorRecord>,
+    /// A failed READONLY rollback, reported in addition to the delete error.
+    pub restore_error: Option<ErrorRecord>,
 }
 
 impl<F: FileSystem> Step<'_, F> {
@@ -289,6 +301,7 @@ impl<F: FileSystem> Step<'_, F> {
             child: None,
             delta: CounterDelta::default(),
             error: None,
+            restore_error: None,
         }
     }
 
@@ -299,6 +312,13 @@ impl<F: FileSystem> Step<'_, F> {
         let retained = record.disposition != "absent";
         self.error = Some(record);
         retained
+    }
+
+    fn record_restore_error(&mut self, path: &Path, error: FsError) {
+        self.restore_error = Some(
+            self.delta
+                .record_error(path.to_string_lossy().into_owned(), error.code()),
+        );
     }
 
     fn finish(
@@ -354,7 +374,7 @@ impl<'a, F: FileSystem> Engine<'a, F> {
             completion: Completion::new(&self.references),
             parent: None,
             rescans: 0,
-            readonly_cleared: false,
+            readonly: ReadonlyRetry::NotAttempted,
             finished: false,
         }
     }
@@ -390,7 +410,7 @@ impl<'a, F: FileSystem> Engine<'a, F> {
                 }
             }
             counters.merge(&step.delta);
-            if let Some(error) = step.error {
+            for error in step.error.into_iter().chain(step.restore_error) {
                 if errors.len() < MAX_ERRORS {
                     errors.push(error);
                 } else {
@@ -473,7 +493,7 @@ impl<'a, F: FileSystem> Engine<'a, F> {
                     completion: Completion::new(&self.references),
                     parent: Some(ParentRef::new(&task.completion)),
                     rescans: 0,
-                    readonly_cleared: false,
+                    readonly: ReadonlyRetry::NotAttempted,
                     finished: false,
                 });
                 return step;
@@ -522,7 +542,7 @@ impl<'a, F: FileSystem> Engine<'a, F> {
                 if !retained {
                     match task
                         .handle
-                        .with(|handle| self.remove(handle, info, &mut task.readonly_cleared))
+                        .with(|handle| self.remove(handle, info, &mut task.readonly))
                     {
                         Ok(classic) => count_removed(&mut step.delta, info, classic),
                         Err(FsError::DirectoryNotEmpty) if task.rescans < 2 => {
@@ -533,6 +553,12 @@ impl<'a, F: FileSystem> Engine<'a, F> {
                             return step;
                         }
                         Err(error) => retained |= step.record_error(&task.path, error),
+                    }
+                }
+                if retained && task.readonly == ReadonlyRetry::Cleared {
+                    if let Err(error) = task.handle.with(|handle| self.fs.restore_readonly(handle))
+                    {
+                        step.record_restore_error(&task.path, error);
                     }
                 }
                 None
@@ -580,21 +606,29 @@ impl<'a, F: FileSystem> Engine<'a, F> {
                 completion: Completion::new(&self.references),
                 parent: Some(ParentRef::new(&task.completion)),
                 rescans: 0,
-                readonly_cleared: false,
+                readonly: ReadonlyRetry::NotAttempted,
                 finished: false,
             });
         } else if self.excluded(&info) {
             step.delta.excluded += 1;
             task.completion.retain();
         } else {
+            let mut readonly = ReadonlyRetry::NotAttempted;
             match handle
                 .get()
-                .and_then(|handle| self.remove(handle, &info, &mut false))
+                .and_then(|handle| self.remove(handle, &info, &mut readonly))
             {
                 Ok(classic) => count_removed(&mut step.delta, &info, classic),
                 Err(error) => {
                     if step.record_error(&path, error) {
                         task.completion.retain();
+                        if readonly == ReadonlyRetry::Cleared {
+                            if let Err(error) =
+                                handle.get().and_then(|h| self.fs.restore_readonly(h))
+                            {
+                                step.record_restore_error(&path, error);
+                            }
+                        }
                     }
                 }
             }
@@ -625,7 +659,7 @@ impl<'a, F: FileSystem> Engine<'a, F> {
         &self,
         handle: &F::Handle,
         info: &BasicInfo,
-        readonly_cleared: &mut bool,
+        readonly: &mut ReadonlyRetry,
     ) -> Result<bool, FsError> {
         if self.policy.dry_run {
             return Ok(false);
@@ -652,10 +686,12 @@ impl<'a, F: FileSystem> Engine<'a, F> {
                     };
                 }
                 Err(FsError::AccessDenied)
-                    if info.attributes & READONLY != 0 && !*readonly_cleared =>
+                    if info.attributes & READONLY != 0
+                        && *readonly == ReadonlyRetry::NotAttempted =>
                 {
-                    *readonly_cleared = true;
+                    *readonly = ReadonlyRetry::ClearFailed;
                     self.fs.clear_readonly(handle)?;
+                    *readonly = ReadonlyRetry::Cleared;
                 }
                 Err(error) => return Err(error),
             }
