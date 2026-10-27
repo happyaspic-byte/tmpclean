@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use crate::fs::{
@@ -47,6 +47,7 @@ struct CompletionState {
     pending: AtomicUsize,
     retained: AtomicBool,
     invalid: AtomicBool,
+    references: Arc<AtomicUsize>,
 }
 
 /// Read-only scheduler view of a directory's outstanding completion references.
@@ -58,12 +59,19 @@ struct CompletionState {
 pub struct Completion(Arc<CompletionState>);
 
 impl Completion {
-    fn new() -> Self {
+    fn new(references: &Arc<AtomicUsize>) -> Self {
+        references.fetch_add(1, Ordering::AcqRel);
         Self(Arc::new(CompletionState {
             pending: AtomicUsize::new(1),
             retained: AtomicBool::new(false),
             invalid: AtomicBool::new(false),
+            references: references.clone(),
         }))
+    }
+
+    fn acquire(&self) {
+        self.0.references.fetch_add(1, Ordering::AcqRel);
+        self.0.pending.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn pending(&self) -> usize {
@@ -90,6 +98,8 @@ impl Completion {
             // Drop cannot return an error; the owning task reports this state.
             self.0.invalid.store(true, Ordering::Release);
             self.retain();
+        } else {
+            self.0.references.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -101,7 +111,7 @@ struct ParentRef {
 
 impl ParentRef {
     fn new(completion: &Completion) -> Self {
-        completion.0.pending.fetch_add(1, Ordering::AcqRel);
+        completion.acquire();
         Self {
             completion: completion.clone(),
             // An unfinished/dropped child must not make its parent deletable.
@@ -152,16 +162,44 @@ impl<F: FileSystem> Drop for OwnedHandle<'_, F> {
     }
 }
 
+/// Name batches share only their pinned parent handle. The short lock covers
+/// relative opens/enumeration, never child dispositions or descendant waits.
+struct SharedHandle<'a, F: FileSystem>(Option<Arc<Mutex<OwnedHandle<'a, F>>>>);
+
+impl<'a, F: FileSystem> SharedHandle<'a, F> {
+    fn new(handle: OwnedHandle<'a, F>) -> Self {
+        Self(Some(Arc::new(Mutex::new(handle))))
+    }
+
+    fn share(&self) -> Self {
+        Self(self.0.clone())
+    }
+
+    fn with<T>(
+        &self,
+        operation: impl FnOnce(&F::Handle) -> Result<T, FsError>,
+    ) -> Result<T, FsError> {
+        let shared = self.0.as_ref().ok_or(FsError::Other(6))?;
+        let handle = shared.lock().map_err(|_| INVALID_STATE)?;
+        operation(handle.get()?)
+    }
+
+    fn close(&mut self) {
+        self.0.take();
+    }
+}
+
 /// Moveable unit of work. Dropping it closes its handle and releases references,
 /// including on cancellation. Stepping a finished task reports an invariant error.
 pub struct DirectoryTask<'a, F: FileSystem> {
-    handle: OwnedHandle<'a, F>,
+    handle: SharedHandle<'a, F>,
     path: PathBuf,
     // None means the pinned root: it has no disposition path.
     info: Option<BasicInfo>,
     entries: Option<EntryBatch>,
     cursor: F::Cursor,
     enumeration_failed: bool,
+    batch: bool,
     enumerating: bool,
     completion: Completion,
     parent: Option<ParentRef>,
@@ -180,7 +218,15 @@ impl<F: FileSystem> DirectoryTask<'_, F> {
     }
 
     pub fn is_root(&self) -> bool {
-        self.info.is_none()
+        self.info.is_none() && !self.batch
+    }
+
+    pub(crate) fn is_batch(&self) -> bool {
+        self.batch
+    }
+
+    pub(crate) fn ready(&self) -> bool {
+        self.enumerating || self.completion.pending() == 0
     }
 
     fn end_enumeration(&mut self) {
@@ -283,6 +329,7 @@ pub struct Engine<'a, F: FileSystem> {
     fs: &'a F,
     policy: Policy,
     now: Duration,
+    references: Arc<AtomicUsize>,
 }
 
 impl<'a, F: FileSystem> Engine<'a, F> {
@@ -293,6 +340,7 @@ impl<'a, F: FileSystem> Engine<'a, F> {
             fs,
             policy,
             now: clock.now(),
+            references: Arc::default(),
         }
     }
 
@@ -300,14 +348,15 @@ impl<'a, F: FileSystem> Engine<'a, F> {
     /// `path` is used only in error records, never to resolve filesystem objects.
     pub fn root_task(&self, root: F::Handle, path: impl Into<PathBuf>) -> DirectoryTask<'a, F> {
         DirectoryTask {
-            handle: OwnedHandle::new(self.fs, root),
+            handle: SharedHandle::new(OwnedHandle::new(self.fs, root)),
             path: path.into(),
             info: None,
             entries: None,
             cursor: F::Cursor::default(),
             enumeration_failed: false,
+            batch: false,
             enumerating: true,
-            completion: Completion::new(),
+            completion: Completion::new(&self.references),
             parent: None,
             rescans: 0,
             readonly_cleared: false,
@@ -373,6 +422,20 @@ impl<'a, F: FileSystem> Engine<'a, F> {
     /// Processes at most one child name or completes the directory. The caller
     /// owns `task` exclusively; child tasks can run on different workers.
     pub fn step(&self, task: &mut DirectoryTask<'a, F>) -> Step<'a, F> {
+        self.step_inner(task, false)
+    }
+
+    /// Scheduler entry point: detach whole name batches before processing leaves.
+    /// A batch owns exactly one parent reference, not one task/reference per file.
+    pub(crate) fn step_batch(&self, task: &mut DirectoryTask<'a, F>) -> Step<'a, F> {
+        self.step_inner(task, true)
+    }
+
+    pub fn pending_references(&self) -> usize {
+        self.references.load(Ordering::Acquire)
+    }
+
+    fn step_inner(&self, task: &mut DirectoryTask<'a, F>, batching: bool) -> Step<'a, F> {
         let mut step = Step::new();
         if task.finished || task.completion.0.invalid.load(Ordering::Acquire) {
             step.record_error(&task.path, INVALID_STATE);
@@ -381,12 +444,11 @@ impl<'a, F: FileSystem> Engine<'a, F> {
             return step;
         }
         if task.enumerating {
-            if task.entries.as_ref().is_none_or(EntryBatch::is_empty) {
+            if !task.batch && task.entries.as_ref().is_none_or(EntryBatch::is_empty) {
                 task.entries = None;
                 match task
                     .handle
-                    .get()
-                    .and_then(|handle| self.fs.enumerate_batch(handle, &mut task.cursor))
+                    .with(|handle| self.fs.enumerate_batch(handle, &mut task.cursor))
                 {
                     Ok(entries) => task.entries = Some(entries),
                     Err(error) => {
@@ -396,6 +458,30 @@ impl<'a, F: FileSystem> Engine<'a, F> {
                         task.end_enumeration();
                     }
                 }
+            }
+            if batching
+                && !task.batch
+                && task
+                    .entries
+                    .as_ref()
+                    .is_some_and(|entries| !entries.is_empty())
+            {
+                step.child = Some(DirectoryTask {
+                    handle: task.handle.share(),
+                    path: task.path.clone(),
+                    info: None,
+                    entries: task.entries.take(),
+                    cursor: F::Cursor::default(),
+                    enumeration_failed: false,
+                    batch: true,
+                    enumerating: true,
+                    completion: Completion::new(&self.references),
+                    parent: Some(ParentRef::new(&task.completion)),
+                    rescans: 0,
+                    readonly_cleared: false,
+                    finished: false,
+                });
+                return step;
             }
             let entry = match task.entries.as_mut() {
                 Some(entries) => entries.next(),
@@ -412,47 +498,51 @@ impl<'a, F: FileSystem> Engine<'a, F> {
             return step;
         }
         let mut retained = task.completion.retained();
-        let outcome =
-            match task.info.as_ref() {
-                None => {
-                    if task.enumeration_failed {
-                        step.finish(task, true, Some(Outcome::FailedToEnumerate));
-                        return step;
-                    }
-                    // This fresh enumeration, not counters or the initial snapshot,
-                    // determines whether the pinned root is actually empty.
-                    let entries = task.handle.get().and_then(|handle| {
-                        self.fs.enumerate_batch(handle, &mut F::Cursor::default())
-                    });
-                    Some(match entries {
-                        Ok(entries) => Outcome::Completed {
-                            fully_empty: entries.is_empty(),
-                        },
-                        Err(error) => {
-                            retained |= step.record_error(&task.path, error);
-                            Outcome::FailedToEnumerate
-                        }
-                    })
+        if task.batch {
+            step.finish(task, retained, None);
+            return step;
+        }
+        let outcome = match task.info.as_ref() {
+            None => {
+                if task.enumeration_failed {
+                    step.finish(task, true, Some(Outcome::FailedToEnumerate));
+                    return step;
                 }
-                Some(info) => {
-                    if !retained {
-                        match task.handle.get().and_then(|handle| {
-                            self.remove(handle, info, &mut task.readonly_cleared)
-                        }) {
-                            Ok(classic) => count_removed(&mut step.delta, info, classic),
-                            Err(FsError::DirectoryNotEmpty) if task.rescans < 2 => {
-                                task.rescans += 1;
-                                task.enumerating = true;
-                                task.cursor = F::Cursor::default();
-                                task.completion.0.pending.fetch_add(1, Ordering::AcqRel);
-                                return step;
-                            }
-                            Err(error) => retained |= step.record_error(&task.path, error),
-                        }
+                // This fresh enumeration, not counters or the initial snapshot,
+                // determines whether the pinned root is actually empty.
+                let entries = task
+                    .handle
+                    .with(|handle| self.fs.enumerate_batch(handle, &mut F::Cursor::default()));
+                Some(match entries {
+                    Ok(entries) => Outcome::Completed {
+                        fully_empty: entries.is_empty(),
+                    },
+                    Err(error) => {
+                        retained |= step.record_error(&task.path, error);
+                        Outcome::FailedToEnumerate
                     }
-                    None
+                })
+            }
+            Some(info) => {
+                if !retained {
+                    match task
+                        .handle
+                        .with(|handle| self.remove(handle, info, &mut task.readonly_cleared))
+                    {
+                        Ok(classic) => count_removed(&mut step.delta, info, classic),
+                        Err(FsError::DirectoryNotEmpty) if task.rescans < 2 => {
+                            task.rescans += 1;
+                            task.enumerating = true;
+                            task.cursor = F::Cursor::default();
+                            task.completion.acquire();
+                            return step;
+                        }
+                        Err(error) => retained |= step.record_error(&task.path, error),
+                    }
                 }
-            };
+                None
+            }
+        };
         step.finish(task, retained, outcome);
         step
     }
@@ -461,7 +551,7 @@ impl<'a, F: FileSystem> Engine<'a, F> {
         let path = task.path.join(&entry.name);
         // Hints are deliberately ignored, including for access selection: the
         // opened object can differ from the enumerated one.
-        let handle = match task.handle.get().and_then(|parent| {
+        let handle = match task.handle.with(|parent| {
             self.fs
                 .open_child_no_follow(parent, &entry.name, crate::fs::Access::DIRECTORY)
         }) {
@@ -484,14 +574,15 @@ impl<'a, F: FileSystem> Engine<'a, F> {
         };
         if !is_link(&info) && info.attributes & DIRECTORY != 0 {
             step.child = Some(DirectoryTask {
-                handle,
+                handle: SharedHandle::new(handle),
                 path,
                 info: Some(info),
                 entries: None,
                 cursor: F::Cursor::default(),
                 enumeration_failed: false,
+                batch: false,
                 enumerating: true,
-                completion: Completion::new(),
+                completion: Completion::new(&self.references),
                 parent: Some(ParentRef::new(&task.completion)),
                 rescans: 0,
                 readonly_cleared: false,

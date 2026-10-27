@@ -150,8 +150,8 @@ impl FileSystem for TrackedFs {
         self.fake.close(handle.raw);
     }
 
-    fn volume_caps(&self, handle: &TrackedHandle) -> VolumeCaps {
-        self.fake.volume_caps(&handle.raw)
+    fn volume_caps(&self, handle: &TrackedHandle, query_extents: bool) -> VolumeCaps {
+        self.fake.volume_caps(&handle.raw, query_extents)
     }
 }
 

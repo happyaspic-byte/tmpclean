@@ -22,6 +22,7 @@ use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::Ioctl::{
     PropertyStandardQuery, StorageDeviceSeekPenaltyProperty, DEVICE_SEEK_PENALTY_DESCRIPTOR,
     FSCTL_GET_REPARSE_POINT, IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_PROPERTY_QUERY,
+    VOLUME_DISK_EXTENTS,
 };
 use windows_sys::Win32::System::Kernel::OBJ_CASE_INSENSITIVE;
 use windows_sys::Win32::System::SystemServices::{
@@ -259,7 +260,7 @@ impl WinFs {
         Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
     }
 
-    fn seek_penalty(handle: &WinHandle) -> Option<bool> {
+    fn volume(handle: &WinHandle) -> Option<OwnedHandle> {
         // Query the device belonging to the pinned handle, not its original path.
         let mut name = vec![0u16; 32_768];
         // SAFETY: the handle is live and the writable UTF-16 buffer has this length.
@@ -299,7 +300,10 @@ impl WinFs {
             return None;
         }
         // SAFETY: successful CreateFileW returned one fresh owned volume handle.
-        let volume = unsafe { OwnedHandle::from_raw_handle(raw) };
+        Some(unsafe { OwnedHandle::from_raw_handle(raw) })
+    }
+
+    fn seek_penalty(volume: &OwnedHandle) -> Option<bool> {
         let query = STORAGE_PROPERTY_QUERY {
             PropertyId: StorageDeviceSeekPenaltyProperty,
             QueryType: PropertyStandardQuery,
@@ -329,6 +333,33 @@ impl WinFs {
         let descriptor = unsafe { descriptor.assume_init() };
         (descriptor.Size >= size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32)
             .then_some(descriptor.IncursSeekPenalty != 0)
+    }
+
+    fn device_id(volume: &OwnedHandle) -> Option<u32> {
+        let mut extents = MaybeUninit::<VOLUME_DISK_EXTENTS>::zeroed();
+        let mut returned = 0;
+        // SAFETY: the live volume handle and aligned SDK output structure match
+        // this synchronous IOCTL. A buffer holding one extent is intentional:
+        // more extents (including ERROR_MORE_DATA) fall back to separate devices.
+        let ok = unsafe {
+            DeviceIoControl(
+                volume.as_raw_handle(),
+                IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                null(),
+                0,
+                extents.as_mut_ptr().cast(),
+                size_of::<VOLUME_DISK_EXTENTS>() as u32,
+                &mut returned,
+                null_mut(),
+            )
+        };
+        if ok == 0 || returned < size_of::<VOLUME_DISK_EXTENTS>() as u32 {
+            return None;
+        }
+        // SAFETY: success returned the complete, zero-initialized integer-only
+        // structure. Never index beyond its one declared extent.
+        let extents = unsafe { extents.assume_init() };
+        (extents.NumberOfDiskExtents == 1).then_some(extents.Extents[0].DiskNumber)
     }
 }
 
@@ -487,12 +518,20 @@ impl FileSystem for WinFs {
         drop(handle);
     }
 
-    fn volume_caps(&self, handle: &WinHandle) -> VolumeCaps {
+    fn volume_caps(&self, handle: &WinHandle, query_extents: bool) -> VolumeCaps {
+        let Some(volume) = Self::volume(handle) else {
+            return VolumeCaps::default();
+        };
         VolumeCaps {
             // Support is established by the disposition operation, not guessed
             // from OS version or a different file on the same device.
             posix_delete: None,
-            seek_penalty: Self::seek_penalty(handle),
+            seek_penalty: Self::seek_penalty(&volume),
+            device_id: if query_extents {
+                Self::device_id(&volume)
+            } else {
+                None
+            },
         }
     }
 }

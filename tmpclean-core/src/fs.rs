@@ -160,6 +160,9 @@ pub struct DispFlags {
 pub struct VolumeCaps {
     pub posix_delete: Option<bool>,
     pub seek_penalty: Option<bool>,
+    /// Physical disk number, queried only when grouping multiple target volumes.
+    /// Unknown/failed or multi-disk extents are deliberately not grouped.
+    pub device_id: Option<u32>,
 }
 
 /// Original codes are retained even when several codes share a classification.
@@ -240,5 +243,5 @@ pub trait FileSystem: Send + Sync {
     fn set_disposition(&self, handle: &Self::Handle, flags: DispFlags) -> Result<(), FsError>;
     fn clear_readonly(&self, handle: &Self::Handle) -> Result<(), FsError>;
     fn close(&self, handle: Self::Handle);
-    fn volume_caps(&self, handle: &Self::Handle) -> VolumeCaps;
+    fn volume_caps(&self, handle: &Self::Handle, query_extents: bool) -> VolumeCaps;
 }

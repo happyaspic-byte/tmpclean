@@ -37,6 +37,7 @@ pub struct FakeStats {
     pub enumerated_directories: Vec<PathBuf>,
     pub in_flight_entries: usize,
     pub peak_in_flight_entries: usize,
+    pub extents_queries: usize,
 }
 
 #[derive(Default)]
@@ -72,6 +73,8 @@ struct State {
     failures: Vec<Failure>,
     enumerated: Vec<PathBuf>,
     caps: VolumeCaps,
+    node_caps: HashMap<u64, VolumeCaps>,
+    extents_queries: usize,
     disposition_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -114,6 +117,8 @@ impl Default for FakeFs {
                 failures: Vec::new(),
                 enumerated: Vec::new(),
                 caps: VolumeCaps::default(),
+                node_caps: HashMap::new(),
+                extents_queries: 0,
                 disposition_hook: None,
             }),
             dispositions: AtomicUsize::new(0),
@@ -341,6 +346,17 @@ impl FakeFs {
         self.state().caps = caps;
     }
 
+    pub fn set_handle_volume_caps(
+        &self,
+        handle: &FakeHandle,
+        caps: VolumeCaps,
+    ) -> Result<(), FsError> {
+        let mut state = self.state();
+        let (id, _) = self.node(&state, handle)?;
+        state.node_caps.insert(id, caps);
+        Ok(())
+    }
+
     /// Called after counting an in-flight disposition and outside the tree lock.
     /// Tests can use barriers or channels here; no timing delays are needed.
     pub fn set_disposition_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
@@ -348,14 +364,16 @@ impl FakeFs {
     }
 
     pub fn stats(&self) -> FakeStats {
+        let state = self.state();
         FakeStats {
             disposition_calls: self.dispositions.load(Ordering::SeqCst),
             clear_readonly_calls: self.clear_readonly.load(Ordering::SeqCst),
             current_dispositions: self.current.load(Ordering::SeqCst),
             max_concurrent_dispositions: self.maximum.load(Ordering::SeqCst),
-            enumerated_directories: self.state().enumerated.clone(),
+            enumerated_directories: state.enumerated.clone(),
             in_flight_entries: self.entry_metrics.current.load(Ordering::SeqCst),
             peak_in_flight_entries: self.entry_metrics.peak.load(Ordering::SeqCst),
+            extents_queries: state.extents_queries,
         }
     }
 }
@@ -526,12 +544,18 @@ impl FileSystem for FakeFs {
         }
     }
 
-    fn volume_caps(&self, handle: &FakeHandle) -> VolumeCaps {
-        let state = self.state();
-        if self.node(&state, handle).is_err() {
-            return VolumeCaps::default();
+    fn volume_caps(&self, handle: &FakeHandle, query_extents: bool) -> VolumeCaps {
+        let mut state = self.state();
+        let id = match self.node(&state, handle) {
+            Ok((id, _)) => id,
+            Err(_) => return VolumeCaps::default(),
+        };
+        state.extents_queries += usize::from(query_extents);
+        let mut caps = state.node_caps.get(&id).copied().unwrap_or(state.caps);
+        if !query_extents {
+            caps.device_id = None;
         }
-        state.caps
+        caps
     }
 }
 
@@ -782,9 +806,10 @@ mod tests {
         let caps = VolumeCaps {
             posix_delete: Some(true),
             seek_penalty: Some(false),
+            device_id: None,
         };
         fs.set_volume_caps(caps);
-        assert_eq!(fs.volume_caps(&fs.root_handle()), caps);
+        assert_eq!(fs.volume_caps(&fs.root_handle(), false), caps);
         assert_eq!(fs.stats().clear_readonly_calls, 1);
     }
 
