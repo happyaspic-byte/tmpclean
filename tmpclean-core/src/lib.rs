@@ -3,6 +3,7 @@
 #[cfg(windows)]
 mod win;
 
+pub mod engine;
 pub mod fs;
 
 /// Crate version, exposed for the binaries.
