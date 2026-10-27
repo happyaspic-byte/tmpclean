@@ -7,6 +7,18 @@ use std::sync::Mutex;
 const NOW: Duration = Duration::from_secs(1_800_000_000);
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
+fn confirmed_policy() -> Policy {
+    Policy {
+        confirm: crate::policy::ConfirmState::Confirmed,
+        min_age: Duration::ZERO,
+        ..Policy::default()
+    }
+}
+
+fn engine<'a, F: FileSystem>(fs: &'a F, clock: &impl Clock, policy: Policy) -> Engine<'a, F> {
+    Engine::new(fs, clock, policy).unwrap()
+}
+
 struct FixedClock;
 
 impl Clock for FixedClock {
@@ -74,7 +86,7 @@ impl TrackedFs {
     }
 
     fn run(&self, policy: Policy) -> RunResult {
-        let result = Engine::new(self, &FixedClock, policy).run(self.root(), "/");
+        let result = engine(self, &FixedClock, policy).run(self.root(), "/");
         self.assert_balanced();
         result
     }
@@ -173,6 +185,7 @@ fn aged_policy() -> Policy {
     Policy {
         min_age: DAY,
         dry_run: false,
+        ..confirmed_policy()
     }
 }
 
@@ -200,7 +213,7 @@ fn engine_three_level_fifty_entries_postorder_root_preserved() {
         let parent = ["", "one/", "one/two/", "one/two/three/"][i % 4];
         fs.file(format!("{parent}file{i}"), sized(i as u64));
     }
-    let result = fs.run(Policy::default());
+    let result = fs.run(confirmed_policy());
     assert_eq!(result.outcome, Outcome::Completed { fully_empty: true });
     assert_eq!(
         result.counters,
@@ -246,7 +259,7 @@ fn reparse_leaf(tag: ReparseTag, untagged: bool) {
     }
     fs.fake.set_basic_info(&link, info).unwrap();
     fs.fake.close(link);
-    let result = Engine::new(&fs, &FixedClock, Policy::default()).run(fs.anchor("temp"), "/temp");
+    let result = engine(&fs, &FixedClock, confirmed_policy()).run(fs.anchor("temp"), "/temp");
     fs.assert_balanced();
     assert_eq!(result.outcome, Outcome::Completed { fully_empty: true });
     assert_eq!(
@@ -323,7 +336,7 @@ fn engine_classifies_opened_handles_not_enumeration_hints() {
             .add_reparse("junction", ReparseTag::Junction, "/elsewhere")
             .unwrap(),
     );
-    let result = fs.run(Policy::default());
+    let result = fs.run(confirmed_policy());
     assert_eq!(result.outcome, Outcome::Completed { fully_empty: true });
     assert_eq!(
         result.counters,
@@ -369,7 +382,7 @@ fn engine_min_age_zero_deletes_recent_nested_file() {
     fs.dir("one");
     fs.dir("one/two");
     fs.file("one/two/recent", recent());
-    let result = fs.run(Policy::default());
+    let result = fs.run(confirmed_policy());
     assert_eq!(result.outcome, Outcome::Completed { fully_empty: true });
     assert_eq!(
         result.counters,
@@ -468,7 +481,7 @@ fn engine_min_age_handles_pre_epoch_and_large_cutoffs() {
         },
     );
     fs.file("at_epoch", sized(1));
-    let result = Engine::new(&fs, &EpochClock, aged_policy()).run(fs.root(), "/");
+    let result = engine(&fs, &EpochClock, aged_policy()).run(fs.root(), "/");
     assert_expected_retention(
         &result,
         Counters {
@@ -482,6 +495,7 @@ fn engine_min_age_handles_pre_epoch_and_large_cutoffs() {
     let result = fs.run(Policy {
         min_age: Duration::MAX,
         dry_run: false,
+        ..confirmed_policy()
     });
     assert_eq!(result.counters.excluded, 1);
 }
@@ -497,7 +511,7 @@ fn engine_nested_sharing_violation_retains_ancestors_without_failure() {
         .unwrap();
     fs.fake.set_locked(&locked, true).unwrap();
     fs.fake.close(locked);
-    let result = fs.run(Policy::default());
+    let result = fs.run(confirmed_policy());
     assert_expected_retention(
         &result,
         Counters {
@@ -530,7 +544,7 @@ fn engine_error_classification_and_handle_balance() {
         fs.inject(name, operation, error, FailureMode::Once);
     }
     fs.file("z_success", sized(7));
-    let result = fs.run(Policy::default());
+    let result = fs.run(confirmed_policy());
     assert_eq!(
         result.counters,
         Counters {
@@ -567,7 +581,7 @@ fn engine_failed_descendant_is_not_retried_or_counted_again_on_ancestors() {
         FsError::AccessDenied,
         FailureMode::Persistent,
     );
-    let result = fs.run(Policy::default());
+    let result = fs.run(confirmed_policy());
     assert_eq!(result.counters.failed, 1);
     assert_eq!(result.errors.len(), 1);
     assert_eq!(fs.fake.stats().disposition_calls, 0);
@@ -611,7 +625,7 @@ fn engine_not_supported_falls_back_to_classic_unconfirmed() {
             FailureMode::Once,
         );
     }
-    let result = fs.run(Policy::default());
+    let result = fs.run(confirmed_policy());
     assert_eq!(
         result.counters,
         Counters {
@@ -634,7 +648,7 @@ fn engine_not_supported_retries_without_ignore_before_classic() {
         FsError::NotSupported(87),
         FailureMode::Once,
     );
-    let result = fs.run(Policy::default());
+    let result = fs.run(confirmed_policy());
     assert_eq!(result.counters.files_removed, 1);
     assert_eq!(result.counters.logical_bytes_removed, 123);
     assert_eq!(result.counters.classic_pending_unconfirmed, 0);
@@ -651,7 +665,7 @@ fn engine_unsupported_classic_is_a_single_final_failure() {
         FsError::NotSupported(50),
         FailureMode::Persistent,
     );
-    let result = fs.run(Policy::default());
+    let result = fs.run(confirmed_policy());
     assert_eq!(result.counters.failed, 1);
     assert_eq!(result.errors.len(), 1);
     assert_eq!(result.errors[0].code, 50);
@@ -677,7 +691,7 @@ fn engine_readonly_clear_retry_preserves_other_attributes() {
         FsError::NotSupported(87),
         FailureMode::Once,
     );
-    let result = fs.run(Policy::default());
+    let result = fs.run(confirmed_policy());
     assert_eq!(result.counters.files_removed, 1);
     assert_eq!(result.counters.logical_bytes_removed, 12);
     assert_eq!(result.counters.failed, 0);
@@ -703,7 +717,7 @@ fn engine_readonly_clear_is_attempted_only_once() {
         FsError::AccessDenied,
         FailureMode::Persistent,
     );
-    let result = fs.run(Policy::default());
+    let result = fs.run(confirmed_policy());
     assert_eq!(result.counters.failed, 1);
     assert_eq!(fs.fake.stats().clear_readonly_calls, 1);
     assert_eq!(disposition_flags(&fs), vec![POSIX_IGNORE, POSIX_IGNORE]);
@@ -731,7 +745,7 @@ fn engine_readonly_clear_failure_is_recorded_and_closed() {
         FsError::Other(1234),
         FailureMode::Once,
     );
-    let result = fs.run(Policy::default());
+    let result = fs.run(confirmed_policy());
     assert_eq!(result.counters.failed, 1);
     assert_eq!(result.errors[0].code, 1234);
     assert_eq!(fs.fake.stats().clear_readonly_calls, 1);
@@ -759,6 +773,7 @@ fn engine_dry_run_counts_would_remove_without_mutation() {
     let result = fs.run(Policy {
         dry_run: true,
         min_age: Duration::ZERO,
+        ..confirmed_policy()
     });
     assert_eq!(
         result.counters,
@@ -773,7 +788,7 @@ fn engine_dry_run_counts_would_remove_without_mutation() {
     assert_eq!(result.outcome, Outcome::Completed { fully_empty: false });
     assert_eq!(fs.fake.stats().disposition_calls, 0);
     assert_eq!(fs.fake.stats().clear_readonly_calls, 0);
-    let actual = fs.run(Policy::default());
+    let actual = fs.run(confirmed_policy());
     assert_eq!(actual.counters, result.counters);
     assert_eq!(actual.outcome, Outcome::Completed { fully_empty: true });
     assert_eq!(fs.fake.stats().clear_readonly_calls, 0);
@@ -789,7 +804,7 @@ fn engine_root_enumeration_failure_never_reports_completed() {
         FsError::AccessDenied,
         FailureMode::Once,
     );
-    let result = fs.run(Policy::default());
+    let result = fs.run(confirmed_policy());
     assert_eq!(result.outcome, Outcome::FailedToEnumerate);
     assert_eq!(result.counters.failed, 1);
     assert_eq!(result.errors[0].code, 5);
@@ -801,7 +816,7 @@ fn engine_root_enumeration_failure_never_reports_completed() {
 fn engine_final_root_enumeration_failure_never_reports_completed() {
     let fs = TrackedFs::default();
     fs.file("file", sized(1));
-    let engine = Engine::new(&fs, &FixedClock, Policy::default());
+    let engine = engine(&fs, &FixedClock, confirmed_policy());
     let mut root = engine.root_task(fs.root(), "/");
     let first = engine.step(&mut root);
     assert_eq!(first.delta.files_removed, 1);
@@ -835,7 +850,7 @@ fn engine_child_enumeration_failure_continues_other_entries() {
         FsError::AccessDenied,
         FailureMode::Persistent,
     );
-    let result = fs.run(Policy::default());
+    let result = fs.run(confirmed_policy());
     assert_eq!(result.outcome, Outcome::Completed { fully_empty: false });
     assert_eq!(result.counters.failed, 1);
     assert_eq!(result.counters.files_removed, 1);
@@ -852,7 +867,7 @@ fn engine_unexplained_directory_not_empty_gets_exactly_two_rescans() {
         FsError::DirectoryNotEmpty,
         FailureMode::Persistent,
     );
-    let result = fs.run(Policy::default());
+    let result = fs.run(confirmed_policy());
     assert_eq!(result.counters.failed, 1);
     assert_eq!(result.counters.dirs_removed, 0);
     assert_eq!(result.errors.len(), 1);
@@ -926,7 +941,7 @@ fn engine_long_and_odd_names_and_empty_directories() {
     fs.dir("empty [] ; ' directory");
     fs.file("x".repeat(300), sized(3));
     fs.file(" space ;[$] ' odd .tmp", sized(4));
-    let result = fs.run(Policy::default());
+    let result = fs.run(confirmed_policy());
     assert_eq!(result.outcome, Outcome::Completed { fully_empty: true });
     assert_eq!(result.counters.files_removed, 2);
     assert_eq!(result.counters.dirs_removed, 1);
@@ -936,7 +951,7 @@ fn engine_long_and_odd_names_and_empty_directories() {
 #[test]
 fn engine_empty_root_is_checked_twice_and_never_disposed() {
     let fs = TrackedFs::default();
-    let result = fs.run(Policy::default());
+    let result = fs.run(confirmed_policy());
     assert_eq!(result.outcome, Outcome::Completed { fully_empty: true });
     assert_eq!(result.counters, Counters::default());
     assert_eq!(fs.fake.stats().disposition_calls, 0);
@@ -952,7 +967,7 @@ fn engine_deep_tree_uses_explicit_stack() {
         fs.dir(&path);
     }
     fs.file(path.join("file"), sized(1));
-    let result = fs.run(Policy::default());
+    let result = fs.run(confirmed_policy());
     assert_eq!(result.outcome, Outcome::Completed { fully_empty: true });
     assert_eq!(result.counters.dirs_removed, 1024);
     assert_eq!(result.counters.files_removed, 1);
@@ -965,7 +980,7 @@ fn engine_directory_steps_support_parallel_children_and_completion_refs() {
         fs.dir(name);
         fs.file(format!("{name}/file"), sized(5));
     }
-    let engine = Engine::new(&fs, &FixedClock, Policy::default());
+    let engine = engine(&fs, &FixedClock, confirmed_policy());
     let mut root = engine.root_task(fs.root(), "/");
     let completion = root.completion();
     let one = engine.step(&mut root).child.unwrap();
@@ -1022,7 +1037,7 @@ fn engine_dropped_tasks_release_all_refs_and_close_handles() {
     let fs = TrackedFs::default();
     fs.dir("one");
     fs.dir("one/two");
-    let engine = Engine::new(&fs, &FixedClock, Policy::default());
+    let engine = engine(&fs, &FixedClock, confirmed_policy());
     let mut root = engine.root_task(fs.root(), "/");
     let root_completion = root.completion();
     let mut one = engine.step(&mut root).child.unwrap();
@@ -1065,7 +1080,7 @@ fn engine_error_records_are_bounded_but_counters_are_exact() {
             FailureMode::Persistent,
         );
     }
-    let result = fs.run(Policy::default());
+    let result = fs.run(confirmed_policy());
     assert_eq!(result.counters.failed, 1001);
     assert_eq!(result.errors.len(), MAX_ERRORS);
     assert!(result.errors_truncated);
@@ -1074,7 +1089,7 @@ fn engine_error_records_are_bounded_but_counters_are_exact() {
 #[test]
 fn engine_finished_task_reports_error_without_reclosing_handles() {
     let fs = TrackedFs::default();
-    let engine = Engine::new(&fs, &FixedClock, Policy::default());
+    let engine = engine(&fs, &FixedClock, confirmed_policy());
     let mut root = engine.root_task(fs.root(), "/");
     assert_eq!(
         engine.step(&mut root).status,
@@ -1101,7 +1116,7 @@ fn engine_finished_task_reports_error_without_reclosing_handles() {
 fn engine_missing_handle_reports_invalid_handle() {
     let fs = TrackedFs::default();
     fs.file("untouched", sized(1));
-    let engine = Engine::new(&fs, &FixedClock, Policy::default());
+    let engine = engine(&fs, &FixedClock, confirmed_policy());
     let mut root = engine.root_task(fs.root(), "/");
     root.handle.close();
     let step = engine.step(&mut root);
@@ -1121,7 +1136,7 @@ fn engine_missing_handle_reports_invalid_handle() {
 #[test]
 fn engine_invalid_completion_reference_reports_error_without_underflow() {
     let fs = TrackedFs::default();
-    let engine = Engine::new(&fs, &FixedClock, Policy::default());
+    let engine = engine(&fs, &FixedClock, confirmed_policy());
     let mut root = engine.root_task(fs.root(), "/");
     let completion = root.completion();
     completion.release();
@@ -1138,7 +1153,7 @@ fn engine_invalid_completion_reference_reports_error_without_underflow() {
 fn engine_premature_finish_returns_error_and_retains_ancestors() {
     let fs = TrackedFs::default();
     fs.dir("child");
-    let engine = Engine::new(&fs, &FixedClock, Policy::default());
+    let engine = engine(&fs, &FixedClock, confirmed_policy());
     let mut root = engine.root_task(fs.root(), "/");
     let child = engine.step(&mut root).child.unwrap();
     let completion = root.completion();
@@ -1155,7 +1170,7 @@ fn engine_batch_flat_hundred_thousand_is_bounded() {
     for i in 0..100_000 {
         fs.close(fs.add_file(format!("file{i:06}"), sized(2)).unwrap());
     }
-    let result = Engine::new(&fs, &FixedClock, Policy::default()).run(fs.root_handle(), "/");
+    let result = engine(&fs, &FixedClock, confirmed_policy()).run(fs.root_handle(), "/");
     assert_eq!(result.outcome, Outcome::Completed { fully_empty: true });
     assert_eq!(result.counters.files_removed, 100_000);
     assert_eq!(result.counters.logical_bytes_removed, 200_000);
@@ -1189,7 +1204,7 @@ fn engine_batch_midstream_error_keeps_completed_counts_and_walks_sibling() {
             );
         }
     })));
-    let result = fs.run(Policy::default());
+    let result = fs.run(confirmed_policy());
     fs.fake.set_disposition_hook(None);
     assert_eq!(result.outcome, Outcome::Completed { fully_empty: false });
     assert_eq!(result.counters.files_removed, 129);

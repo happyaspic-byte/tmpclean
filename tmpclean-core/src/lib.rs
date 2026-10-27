@@ -5,6 +5,7 @@ pub mod win;
 
 pub mod engine;
 pub mod fs;
+pub mod policy;
 pub mod resolve;
 pub mod sched;
 

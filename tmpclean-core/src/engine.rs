@@ -11,7 +11,8 @@
 //! enumeration holds its initial completion reference; every emitted child holds
 //! one more until it finishes or is dropped. Park a waiting parent without an I/O
 //! permit, then resume it after its last child releases its reference. Handles
-//! need only be `Send`, not `Sync`: each task has exactly one owner.
+//! need only be `Send`, not `Sync`: one directory owns the cursor, and its name
+//! batches serialize relative opens through the pinned parent handle.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -22,18 +23,11 @@ use crate::fs::{
     BasicInfo, DispFlags, Entry, EntryBatch, FileSystem, FsError, DIRECTORY, READONLY,
     REPARSE_POINT,
 };
+use crate::policy::{Policy, Refusal};
 use crate::report::{Clock, CounterDelta, Counters, ErrorRecord, Outcome, MAX_ERRORS};
 
 // ERROR_INVALID_DATA: an internal traversal/completion protocol violation.
 const INVALID_STATE: FsError = FsError::Other(13);
-
-/// Engine inputs; confirmation and surface defaults belong to the policy layer.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Policy {
-    pub dry_run: bool,
-    /// Zero disables age filtering. Directories are never age-filtered.
-    pub min_age: Duration,
-}
 
 #[derive(Debug)]
 pub struct RunResult {
@@ -194,7 +188,7 @@ impl<'a, F: FileSystem> SharedHandle<'a, F> {
 pub struct DirectoryTask<'a, F: FileSystem> {
     handle: SharedHandle<'a, F>,
     path: PathBuf,
-    // None means the pinned root: it has no disposition path.
+    // None means a pinned root or a name batch: neither has a disposition path.
     info: Option<BasicInfo>,
     entries: Option<EntryBatch>,
     cursor: F::Cursor,
@@ -282,7 +276,7 @@ pub enum StepStatus {
 /// One entry (or directory completion) and its worker-local reporting delta.
 pub struct Step<'a, F: FileSystem> {
     pub status: StepStatus,
-    /// A child directory to schedule; the parent may continue enumerating.
+    /// A child directory (or scheduler name batch); its parent may continue.
     pub child: Option<DirectoryTask<'a, F>>,
     pub delta: CounterDelta,
     pub error: Option<ErrorRecord>,
@@ -335,13 +329,14 @@ pub struct Engine<'a, F: FileSystem> {
 impl<'a, F: FileSystem> Engine<'a, F> {
     /// `clock.now()` must be time since UNIX_EPOCH for age comparisons, rather
     /// than an arbitrary monotonic origin. Sample once for a stable run cutoff.
-    pub fn new(fs: &'a F, clock: &impl Clock, policy: Policy) -> Self {
-        Self {
+    pub fn new(fs: &'a F, clock: &impl Clock, policy: Policy) -> Result<Self, Refusal> {
+        policy.check()?;
+        Ok(Self {
             fs,
             policy,
             now: clock.now(),
             references: Arc::default(),
-        }
+        })
     }
 
     /// Takes ownership of the validated root handle; it is closed, never disposed.

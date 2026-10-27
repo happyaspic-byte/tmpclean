@@ -14,8 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Condvar, Mutex, MutexGuard};
 use std::thread;
 
-use crate::engine::{DirectoryTask, Engine, Policy, RunResult, StepStatus};
+use crate::engine::{DirectoryTask, Engine, RunResult, StepStatus};
 use crate::fs::{FileSystem, VolumeCaps};
+use crate::policy::{Policy, Refusal};
 use crate::report::{
     Aggregator, CancelToken, Clock, CounterDelta, ErrorRecord, Outcome, Snapshot, MAX_ERRORS,
 };
@@ -77,14 +78,14 @@ fn volume_key(path: &Path, index: usize) -> String {
 }
 
 impl<'a, F: FileSystem, C: Clock> Scheduler<'a, F, C> {
-    pub fn new(fs: &'a F, clock: C, policy: Policy, io_permits: Option<NonZeroUsize>) -> Self {
-        Self {
+    pub fn new(fs: &'a F, clock: C, policy: Policy) -> Result<Self, Refusal> {
+        Ok(Self {
             fs,
-            engine: Engine::new(fs, &clock, policy),
+            engine: Engine::new(fs, &clock, policy)?,
             clock,
-            io_permits,
+            io_permits: policy.io_permits,
             stats: SchedulingStats::default(),
-        }
+        })
     }
 
     pub fn stats(&self) -> &SchedulingStats {
@@ -355,6 +356,23 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    fn scheduler(
+        fs: &FakeFs,
+        io_permits: Option<NonZeroUsize>,
+    ) -> Scheduler<'_, FakeFs, FixedClock> {
+        Scheduler::new(
+            fs,
+            FixedClock,
+            Policy {
+                confirm: crate::policy::ConfirmState::Confirmed,
+                min_age: Duration::ZERO,
+                io_permits,
+                ..Policy::default()
+            },
+        )
+        .unwrap()
+    }
+
     struct FixedClock;
 
     impl Clock for FixedClock {
@@ -417,12 +435,7 @@ mod tests {
                     assert_eq!(*arrived, width, "all permitted dispositions must overlap");
                 }
             })));
-            let mut scheduler = Scheduler::new(
-                &fs,
-                FixedClock,
-                Policy::default(),
-                NonZeroUsize::new(permits),
-            );
+            let mut scheduler = scheduler(&fs, NonZeroUsize::new(permits));
             let mut snapshots = Vec::new();
             let result = scheduler.run(
                 vec![Root {
@@ -480,8 +493,7 @@ mod tests {
                     token.cancel();
                 }
             })));
-            let mut scheduler =
-                Scheduler::new(&fs, FixedClock, Policy::default(), NonZeroUsize::new(1));
+            let mut scheduler = scheduler(&fs, NonZeroUsize::new(1));
             let result = scheduler.run(
                 vec![Root {
                     handle: fs.root_handle(),
@@ -538,7 +550,7 @@ mod tests {
                 let fs = FakeFs::new();
                 fs.set_volume_caps(caps);
                 flat(&fs, "", 10);
-                let mut scheduler = Scheduler::new(&fs, FixedClock, Policy::default(), None);
+                let mut scheduler = scheduler(&fs, None);
                 let result = scheduler.run(
                     vec![Root {
                         handle: fs.root_handle(),
@@ -586,7 +598,7 @@ mod tests {
                         .into(),
                     });
                 }
-                let mut scheduler = Scheduler::new(&fs, FixedClock, Policy::default(), None);
+                let mut scheduler = scheduler(&fs, None);
                 let result = scheduler.run(roots, &CancelToken::new(), |_| {});
                 assert_eq!(result.counters.files_removed, 20);
                 assert_eq!(scheduler.stats().device_permits, expected);
@@ -601,8 +613,7 @@ mod tests {
         bounded(|| {
             let fs = FakeFs::new();
             flat(&fs, "", 100_000);
-            let mut scheduler =
-                Scheduler::new(&fs, FixedClock, Policy::default(), NonZeroUsize::new(4));
+            let mut scheduler = scheduler(&fs, NonZeroUsize::new(4));
             let result = scheduler.run(
                 vec![Root {
                     handle: fs.root_handle(),
@@ -628,13 +639,72 @@ mod tests {
     }
 
     #[test]
+    fn sched_policy_dryrun_and_parallel_cancel_keep_partial_counts_exact() {
+        bounded(|| {
+            let fs = FakeFs::new();
+            flat(&fs, "", 1000);
+            let policy = Policy {
+                dry_run: true,
+                min_age: Duration::ZERO,
+                io_permits: NonZeroUsize::new(4),
+                ..Policy::default()
+            };
+            let mut preview = Scheduler::new(&fs, FixedClock, policy).unwrap();
+            let result = preview.run(
+                vec![Root {
+                    handle: fs.root_handle(),
+                    path: "/".into(),
+                }],
+                &CancelToken::new(),
+                |_| {},
+            );
+            assert_eq!(result.counters.files_removed, 1000);
+            assert_eq!(fs.stats().disposition_calls, 0);
+            assert_eq!(fs.stats().clear_readonly_calls, 0);
+            assert_eq!(preview.stats().pending_references, 0);
+            let cancel = CancelToken::new();
+            let token = cancel.clone();
+            let calls = AtomicUsize::new(0);
+            fs.set_disposition_hook(Some(Arc::new(move || {
+                if calls.fetch_add(1, Ordering::SeqCst) == 99 {
+                    token.cancel();
+                }
+            })));
+            let mut scheduler = scheduler(&fs, NonZeroUsize::new(4));
+            let result = scheduler.run(
+                vec![Root {
+                    handle: fs.root_handle(),
+                    path: "/".into(),
+                }],
+                &cancel,
+                |_| {},
+            );
+            assert_eq!(result.outcome, Outcome::Canceled);
+            assert!((100..=103).contains(&result.counters.files_removed));
+            assert_eq!(
+                result.counters.files_removed,
+                fs.stats().disposition_calls as u64
+            );
+            assert_eq!(
+                result.counters.logical_bytes_removed,
+                result.counters.files_removed * 3
+            );
+            assert_eq!(result.counters.failed, 0);
+            assert_eq!(scheduler.stats().pending_references, 0);
+            assert_eq!(fs.stats().current_dispositions, 0);
+            assert_eq!(fs.stats().in_flight_entries, 0);
+            fs.set_disposition_hook(None);
+        });
+    }
+
+    #[test]
     fn sched_pre_canceled_never_enumerates_or_disposes() {
         bounded(|| {
             let fs = FakeFs::new();
             flat(&fs, "", 100);
             let cancel = CancelToken::new();
             cancel.cancel();
-            let mut scheduler = Scheduler::new(&fs, FixedClock, Policy::default(), None);
+            let mut scheduler = scheduler(&fs, None);
             let result = scheduler.run(
                 vec![Root {
                     handle: fs.root_handle(),
