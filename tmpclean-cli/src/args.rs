@@ -39,6 +39,10 @@ pub struct Cli {
     /// Concurrent deletions per physical device (default: chosen per device).
     #[arg(long, value_name = "N", env = "TMPCLEAN_IO_PERMITS")]
     pub io_permits: Option<NonZeroUsize>,
+
+    /// Print scheduler diagnostics to stderr after the run.
+    #[arg(long, hide = true)]
+    pub stats: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]

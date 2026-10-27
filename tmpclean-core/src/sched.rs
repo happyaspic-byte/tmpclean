@@ -13,6 +13,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Condvar, Mutex, MutexGuard};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::engine::{DirectoryTask, Engine, RunResult, StepStatus};
 use crate::fs::{FileSystem, VolumeCaps};
@@ -34,6 +35,17 @@ pub struct SchedulingStats {
     pub device_permits: Vec<usize>,
     /// Enumeration and parent references, including abandoned work on cancellation.
     pub pending_references: usize,
+    pub worker_stats: Vec<WorkerStats>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct WorkerStats {
+    pub steps: u64,
+    pub directories: u64,
+    pub batches: u64,
+    pub io_time: Duration,
+    pub reporting_time: Duration,
+    pub waiting_time: Duration,
 }
 
 pub struct Scheduler<'a, F: FileSystem, C: Clock> {
@@ -166,12 +178,13 @@ impl<'a, F: FileSystem, C: Clock> Scheduler<'a, F, C> {
         let mut errors = Vec::new();
         let mut outcome = Outcome::Completed { fully_empty: true };
         let (sender, receiver) = mpsc::sync_channel(workers * 4);
+        let mut worker_stats = vec![WorkerStats::default(); workers];
         thread::scope(|scope| {
-            for worker in 0..workers {
+            for (worker, stats) in worker_stats.iter_mut().enumerate() {
                 let sender = sender.clone();
                 let pool = &pool;
                 let engine = &self.engine;
-                scope.spawn(move || drive(worker, engine, pool, cancel, sender));
+                scope.spawn(move || drive(worker, engine, pool, cancel, sender, stats));
             }
             drop(sender);
             for event in receiver {
@@ -209,6 +222,7 @@ impl<'a, F: FileSystem, C: Clock> Scheduler<'a, F, C> {
             peak_queued: lock(&pool.state).peak,
             device_permits: pool.permits.clone(),
             pending_references: self.engine.pending_references(),
+            worker_stats,
         };
         RunResult {
             outcome,
@@ -275,6 +289,7 @@ fn drive<'a, F: FileSystem>(
     pool: &Pool<'a, F>,
     cancel: &CancelToken,
     sender: mpsc::SyncSender<Event>,
+    stats: &mut WorkerStats,
 ) {
     let mut stack: Vec<Work<'a, F>> = Vec::new();
     let mut state = lock(&pool.state);
@@ -299,7 +314,10 @@ fn drive<'a, F: FileSystem>(
             if work.task.ready() && state.active_io[device] < pool.permits[device] {
                 state.active_io[device] += 1;
                 drop(state);
+                let started = Instant::now();
                 let step = engine.step_batch(&mut work.task);
+                stats.io_time += started.elapsed();
+                stats.steps += 1;
                 state = lock(&pool.state);
                 state.active_io[device] -= 1;
                 let outcome = if let StepStatus::Finished { outcome, .. } = step.status {
@@ -310,6 +328,11 @@ fn drive<'a, F: FileSystem>(
                     None
                 };
                 if let Some(task) = step.child {
+                    if task.is_batch() {
+                        stats.batches += 1;
+                    } else {
+                        stats.directories += 1;
+                    }
                     state.outstanding += 1;
                     let work = Work { task, device };
                     if work.task.is_batch() && state.queued < pool.capacity {
@@ -323,6 +346,7 @@ fn drive<'a, F: FileSystem>(
                 pool.changed.notify_all();
                 // Release both the permit and pool lock before bounded reporting.
                 drop(state);
+                let started = Instant::now();
                 if sender
                     .send(Event {
                         delta: step.delta,
@@ -333,6 +357,7 @@ fn drive<'a, F: FileSystem>(
                 {
                     return;
                 }
+                stats.reporting_time += started.elapsed();
                 state = lock(&pool.state);
                 continue;
             }
@@ -340,10 +365,12 @@ fn drive<'a, F: FileSystem>(
         if state.outstanding == 0 {
             return;
         }
+        let started = Instant::now();
         state = match pool.changed.wait(state) {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        stats.waiting_time += started.elapsed();
     }
 }
 

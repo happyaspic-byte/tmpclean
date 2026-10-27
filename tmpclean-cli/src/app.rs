@@ -109,11 +109,15 @@ pub fn run() -> ExitCode {
             scope
                 .spawn(|| {
                     let mut scheduler = Scheduler::new(&fs, SystemClock, policy)?;
-                    Ok(scheduler.run(roots, &cancel, |snapshot| {
+                    let result = scheduler.run(roots, &cancel, |snapshot| {
                         if !json {
                             progress(&snapshot);
                         }
-                    }))
+                    });
+                    if cli.stats {
+                        eprintln!("STATS {:?}", scheduler.stats());
+                    }
+                    Ok(result)
                 })
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic))

@@ -18,6 +18,7 @@ param(
     [string]$Exe = 'target/release/tmpclean.exe',
     [int]$BenchFiles = 50000,
     [double]$MaxRatio = 0.7,
+    [switch]$Scaling,
     [switch]$SkipBench,
     [switch]$NegativeControl
 )
@@ -181,23 +182,42 @@ try {
     $job = $null
 
     if (-not $SkipBench) {
-        $times = @{}
-        foreach ($mode in 'single', 'auto') {
-            Remove-Fixture
-            [void][IO.Directory]::CreateDirectory($root)
-            $seed = Measure-Command { New-BenchTree $BenchFiles }
-            $extra = if ($mode -eq 'single') { @('--io-permits', '1') } else { @() }
-            $bench = $null
-            $elapsed = Measure-Command { $script:bench = Invoke-Tmpclean $extra }
-            $bench = $script:bench
-            $times[$mode] = $elapsed.TotalSeconds
-            Write-Output ("BENCH {0}: {1:N3} s (seeded {2} files in {3:N1} s)" -f $mode, $elapsed.TotalSeconds, $BenchFiles, $seed.TotalSeconds)
-            Assert-That ($bench.Code -eq 0) "bench $mode exit 0 (got $($bench.Code))"
-            Assert-That ($null -ne $bench.Report -and $bench.Report.counters.files_removed -eq $BenchFiles) "bench $mode removed $BenchFiles files ($($bench.Report.counters.files_removed))"
-            Assert-That (@(Get-ChildItem -LiteralPath $root -Force).Count -eq 0) "bench $mode left the root empty"
+        $modes = if ($Scaling) { @('1', '2', '4', '8', 'auto') } else { @('1', 'auto') }
+        $samples = @{}
+        foreach ($mode in $modes) { $samples[$mode] = [Collections.Generic.List[double]]::new() }
+        Write-Output "BENCH layout: fanout=2x5x5x5x5 leaf_dirs=1250 total_dirs=1562 files=$BenchFiles files_per_leaf=$($BenchFiles / 1250) bytes_per_file=64"
+        for ($rep = 1; $rep -le 2; $rep++) {
+            # Reverse the second sweep to expose run-order/cache effects.
+            $order = $modes.Clone()
+            if ($rep -eq 2) { [Array]::Reverse($order) }
+            foreach ($mode in $order) {
+                Remove-Fixture
+                [void][IO.Directory]::CreateDirectory($root)
+                $seed = Measure-Command { New-BenchTree $BenchFiles }
+                Assert-That (@(Get-ChildItem -LiteralPath $root -Recurse -File -Force).Count -eq $BenchFiles) "bench $mode rep $rep freshly seeded $BenchFiles files"
+                $extra = @('--stats')
+                if ($mode -ne 'auto') { $extra += @('--io-permits', $mode) }
+                $elapsed = Measure-Command { $script:bench = Invoke-Tmpclean $extra }
+                $bench = $script:bench
+                $samples[$mode].Add($elapsed.TotalSeconds)
+                Write-Output ("BENCH mode={0} rep={1} seconds={2:F6} seed_seconds={3:F3}" -f $mode, $rep, $elapsed.TotalSeconds, $seed.TotalSeconds)
+                Assert-That ($bench.Code -eq 0) "bench $mode rep $rep exit 0 (got $($bench.Code))"
+                Assert-That ($null -ne $bench.Report -and $bench.Report.counters.files_removed -eq $BenchFiles) "bench $mode rep $rep removed $BenchFiles files ($($bench.Report.counters.files_removed))"
+                Assert-That ($bench.Report.counters.dirs_removed -eq 1562 -and $bench.Report.counters.logical_bytes_removed -eq (64 * $BenchFiles) -and $bench.Report.counters.failed -eq 0) "bench $mode rep $rep exact directory and byte counters; no failures"
+                Assert-That (Test-Path -LiteralPath $root -PathType Container) "bench $mode rep $rep kept root"
+                Assert-That (@(Get-ChildItem -LiteralPath $root -Force).Count -eq 0) "bench $mode rep $rep left the root empty"
+            }
         }
-        $ratio = $times['auto'] / $times['single']
-        Write-Output ("BENCH single_s={0:N3} auto_s={1:N3} ratio={2:N3} threshold={3}" -f $times['single'], $times['auto'], $ratio, $MaxRatio)
+        $times = @{}
+        Write-Output 'SCALING mode rep1_s rep2_s mean_s range_pct'
+        foreach ($mode in $modes) {
+            $summary = $samples[$mode] | Measure-Object -Average -Minimum -Maximum
+            $times[$mode] = $summary.Average
+            $range = 100 * ($summary.Maximum - $summary.Minimum) / $summary.Average
+            Write-Output ("SCALING {0} {1:F6} {2:F6} {3:F6} {4:F2}" -f $mode, $samples[$mode][0], $samples[$mode][1], $summary.Average, $range)
+        }
+        $ratio = $times['auto'] / $times['1']
+        Write-Output ("BENCH single_s={0:N3} auto_s={1:N3} ratio={2:N3} threshold={3}" -f $times['1'], $times['auto'], $ratio, $MaxRatio)
         Assert-That ($ratio -le $MaxRatio) ("benchmark: auto <= {0}x single (ratio {1:N3})" -f $MaxRatio, $ratio)
     }
 } finally {

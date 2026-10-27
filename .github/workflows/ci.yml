@@ -41,7 +41,7 @@ jobs:
         run: pwsh -NoProfile -File scripts/check-release.ps1 target/release
       - name: e2e (real-surface QA + benchmark)
         shell: pwsh
-        run: pwsh -NoProfile -File scripts/e2e.ps1 -Exe target/release/tmpclean.exe
+        run: pwsh -NoProfile -File scripts/e2e.ps1 -Exe target/release/tmpclean.exe -Scaling
       - name: e2e negative control (must fail)
         if: ${{ !cancelled() }}
         shell: pwsh
