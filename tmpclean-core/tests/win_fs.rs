@@ -64,7 +64,10 @@ fn extended(path: &Path) -> PathBuf {
 fn cleanup(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     let reparse = metadata.file_attributes() & REPARSE_POINT != 0;
-    if metadata.is_dir() && !reparse {
+    // FileType::is_dir excludes symlinks, even for a directory junction. The
+    // native bit still identifies how to remove a dangling directory link.
+    let directory = metadata.file_attributes() & DIRECTORY != 0;
+    if directory && !reparse {
         for child in fs::read_dir(path)? {
             cleanup(&child?.path())?;
         }
@@ -79,7 +82,7 @@ fn cleanup(path: &Path) -> io::Result<()> {
             ));
         }
     }
-    if metadata.is_dir() {
+    if directory {
         fs::remove_dir(path)
     } else {
         fs::remove_file(path)
