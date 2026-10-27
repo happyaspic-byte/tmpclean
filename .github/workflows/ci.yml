@@ -39,6 +39,17 @@ jobs:
       - name: check-release
         shell: pwsh
         run: pwsh -NoProfile -File scripts/check-release.ps1 target/release
+      - name: e2e (real-surface QA + benchmark)
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/e2e.ps1 -Exe target/release/tmpclean.exe
+      - name: e2e negative control (must fail)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/e2e.ps1 -Exe target/release/tmpclean.exe -SkipBench -NegativeControl
+          if ($LASTEXITCODE -eq 0) { throw 'e2e.ps1 reported success despite a failing assertion' }
+          Write-Output "negative control: e2e.ps1 exited $LASTEXITCODE as expected"
+          exit 0
       - name: test-check-release
         shell: pwsh
         run: pwsh -NoProfile -File scripts/test-check-release.ps1
