@@ -37,6 +37,7 @@ enum ReadonlyRetry {
     NotAttempted,
     ClearFailed,
     Cleared,
+    RestoreAttempted,
 }
 
 #[derive(Debug)]
@@ -540,10 +541,20 @@ impl<'a, F: FileSystem> Engine<'a, F> {
             }
             Some(info) => {
                 if !retained {
-                    match task
+                    let result = task
                         .handle
-                        .with(|handle| self.remove(handle, info, &mut task.readonly))
-                    {
+                        .with(|handle| self.remove(handle, info, &mut task.readonly));
+                    // A rescan yields to the scheduler, which may drop this task
+                    // on cancellation. Roll back before any failed retry yields.
+                    if result.is_err() && task.readonly == ReadonlyRetry::Cleared {
+                        task.readonly = ReadonlyRetry::RestoreAttempted;
+                        if let Err(error) =
+                            task.handle.with(|handle| self.fs.restore_readonly(handle))
+                        {
+                            step.record_restore_error(&task.path, error);
+                        }
+                    }
+                    match result {
                         Ok(classic) => count_removed(&mut step.delta, info, classic),
                         Err(FsError::DirectoryNotEmpty) if task.rescans < 2 => {
                             task.rescans += 1;
@@ -553,12 +564,6 @@ impl<'a, F: FileSystem> Engine<'a, F> {
                             return step;
                         }
                         Err(error) => retained |= step.record_error(&task.path, error),
-                    }
-                }
-                if retained && task.readonly == ReadonlyRetry::Cleared {
-                    if let Err(error) = task.handle.with(|handle| self.fs.restore_readonly(handle))
-                    {
-                        step.record_restore_error(&task.path, error);
                     }
                 }
                 None

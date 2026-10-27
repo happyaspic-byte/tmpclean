@@ -20,6 +20,15 @@ pub const GUI_EXIT_CODE: &str = "exit code";
 pub const GUI_DRY_RUN_NOTE: &str = "Dry run: counters are would-remove totals.";
 pub const GUI_WINDOW_FAILED: &str = "Unable to create the tmpclean window.";
 pub const GUI_WINDOWS_ONLY: &str = "tmpclean-gui runs only on Windows.";
+// GUI flag help (tmpclean-gui --help).
+pub const GUI_ABOUT: &str = "Fast, safe Windows temp folder cleaner (window)";
+pub const GUI_HELP_TARGETS: &str = "Comma-separated targets to clean";
+pub const GUI_HELP_DRY_RUN: &str = "Count what would be removed without deleting anything";
+pub const GUI_HELP_YES: &str = "Start immediately, without the 5 s countdown";
+pub const GUI_HELP_MIN_AGE: &str =
+    "Skip files modified more recently than this (e.g. 90s, 30m, 24h, 7d; 0 disables)";
+pub const GUI_HELP_JSON: &str = "Accepted for CLI parity; the window shows the summary instead";
+pub const GUI_HELP_IO_PERMITS: &str = "Per-device I/O permits override";
 // GUI `--min-age` validation, shown in the usage message box; the quoted
 // input goes between prefix and suffix.
 pub const GUI_ARG_DURATION_INVALID_PREFIX: &str = "invalid duration ";

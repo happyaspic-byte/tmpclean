@@ -840,6 +840,74 @@ fn engine_readonly_clear_success_is_not_restored() {
 }
 
 #[test]
+fn engine_readonly_directory_rescan_restores_before_error_or_finish() {
+    for enumeration_error in [false, true] {
+        for restore_error in [false, true] {
+            let fs = Arc::new(FakeFs::new());
+            let dir = fs.add_dir("dir").unwrap();
+            fs.set_basic_info(
+                &dir,
+                BasicInfo {
+                    attributes: DIRECTORY | READONLY,
+                    ..BasicInfo::default()
+                },
+            )
+            .unwrap();
+            for (error, mode) in [
+                (FsError::AccessDenied, FailureMode::Once),
+                (FsError::DirectoryNotEmpty, FailureMode::Persistent),
+            ] {
+                fs.inject_failure("dir", Operation::SetDisposition, error, mode)
+                    .unwrap();
+            }
+            if restore_error {
+                fs.inject_failure(
+                    "dir",
+                    Operation::RestoreReadonly,
+                    FsError::Other(1234),
+                    FailureMode::Persistent,
+                )
+                .unwrap();
+            }
+            if enumeration_error {
+                let weak = Arc::downgrade(&fs);
+                let calls = AtomicUsize::new(0);
+                fs.set_disposition_hook(Some(Arc::new(move || {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                        weak.upgrade()
+                            .unwrap()
+                            .inject_failure(
+                                "dir",
+                                Operation::Enumerate,
+                                FsError::Other(5678),
+                                FailureMode::Once,
+                            )
+                            .unwrap();
+                    }
+                })));
+            }
+            let result =
+                engine(fs.as_ref(), &FixedClock, confirmed_policy()).run(fs.root_handle(), "/");
+            assert_eq!(result.outcome, Outcome::Completed { fully_empty: false });
+            assert_eq!(result.counters.failed, 1 + u64::from(restore_error));
+            assert_eq!(result.errors.len(), 1 + usize::from(restore_error));
+            assert_eq!(
+                result.errors.iter().filter(|e| e.code == 1234).count(),
+                usize::from(restore_error)
+            );
+            assert_eq!(fs.stats().clear_readonly_calls, 1);
+            assert_eq!(fs.stats().restore_readonly_calls, 1);
+            assert_eq!(result.counters.dirs_removed, 0);
+            assert_eq!(
+                fs.basic_info(&dir).unwrap().attributes,
+                DIRECTORY | if restore_error { 0 } else { READONLY }
+            );
+            fs.close(dir);
+        }
+    }
+}
+
+#[test]
 fn engine_readonly_clear_failure_is_recorded_and_closed() {
     let fs = TrackedFs::default();
     fs.file(

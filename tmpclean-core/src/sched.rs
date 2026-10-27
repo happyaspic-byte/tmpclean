@@ -826,6 +826,176 @@ mod tests {
     }
 
     #[test]
+    fn sched_cancel_after_readonly_directory_retry_restores_before_rescan() {
+        bounded(|| {
+            use crate::fs::{FailureMode, FsError, Operation, DIRECTORY, READONLY};
+
+            let fs = FakeFs::new();
+            let dir = fs.add_dir("dir").unwrap();
+            fs.set_basic_info(
+                &dir,
+                BasicInfo {
+                    attributes: DIRECTORY | READONLY,
+                    ..BasicInfo::default()
+                },
+            )
+            .unwrap();
+            fs.inject_failure(
+                "dir",
+                Operation::SetDisposition,
+                FsError::AccessDenied,
+                FailureMode::Once,
+            )
+            .unwrap();
+            fs.inject_failure(
+                "dir",
+                Operation::SetDisposition,
+                FsError::DirectoryNotEmpty,
+                FailureMode::Persistent,
+            )
+            .unwrap();
+            let cancel = CancelToken::new();
+            let on_second = cancel.clone();
+            let calls = AtomicUsize::new(0);
+            fs.set_disposition_hook(Some(Arc::new(move || {
+                if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                    on_second.cancel();
+                }
+            })));
+            let mut scheduler = scheduler(&fs, NonZeroUsize::new(1));
+            let result = scheduler.run(
+                vec![Root {
+                    handle: fs.root_handle(),
+                    path: "/".into(),
+                }],
+                &cancel,
+                |_| {},
+            );
+            let attributes = fs.basic_info(&dir).unwrap().attributes;
+            let stats = fs.stats();
+            println!(
+                "canceled directory: attributes={attributes:#x}, clear={}, restore={}, dispositions={}",
+                stats.clear_readonly_calls, stats.restore_readonly_calls, stats.disposition_calls
+            );
+            assert_eq!(result.outcome, Outcome::Canceled);
+            assert_eq!(scheduler.stats().pending_references, 0);
+            assert_eq!(result.counters.dirs_removed, 0);
+            assert_eq!(result.counters.failed, 0);
+            assert!(result.errors.is_empty());
+            let root = fs.root_handle();
+            assert_eq!(fs.enumerate(&root).unwrap().len(), 1);
+            fs.close(root);
+            assert_eq!(stats.clear_readonly_calls, 1);
+            assert_eq!(stats.disposition_calls, 2);
+            assert_eq!(attributes, DIRECTORY | READONLY);
+            assert_eq!(stats.restore_readonly_calls, 1);
+            fs.close(dir);
+        });
+    }
+
+    #[test]
+    fn sched_readonly_archive_cancel_restores_serial_and_parallel() {
+        let mut observations = Vec::new();
+        for permits in [None, Some(1), Some(4)] {
+            observations.push(bounded(move || {
+                use crate::fs::{FailureMode, FsError, Operation, DIRECTORY, READONLY};
+
+                let fs = FakeFs::new();
+                let dir = fs.add_dir("readonly-dir").unwrap();
+                let before = DIRECTORY | READONLY | 0x20;
+                fs.set_basic_info(
+                    &dir,
+                    BasicInfo {
+                        attributes: before,
+                        ..BasicInfo::default()
+                    },
+                )
+                .unwrap();
+                for error in [FsError::AccessDenied, FsError::DirectoryNotEmpty] {
+                    fs.inject_failure(
+                        "readonly-dir",
+                        Operation::SetDisposition,
+                        error,
+                        FailureMode::Once,
+                    )
+                    .unwrap();
+                }
+                let cancel = CancelToken::new();
+                let token = cancel.clone();
+                let dispositions = AtomicUsize::new(0);
+                fs.set_disposition_hook(Some(Arc::new(move || {
+                    if dispositions.fetch_add(1, Ordering::SeqCst) == 1 {
+                        token.cancel();
+                    }
+                })));
+                let (counters, errors, pending) = if let Some(permits) = permits {
+                    let mut scheduler = scheduler(&fs, NonZeroUsize::new(permits));
+                    let result = scheduler.run(
+                        vec![Root {
+                            handle: fs.root_handle(),
+                            path: "/".into(),
+                        }],
+                        &cancel,
+                        |_| {},
+                    );
+                    assert_eq!(result.outcome, Outcome::Canceled);
+                    (
+                        result.counters,
+                        result.errors,
+                        scheduler.stats().pending_references,
+                    )
+                } else {
+                    // The serial Engine API exposes cancellation through task
+                    // ownership: stop stepping and drop tasks at this boundary.
+                    let engine = Engine::new(
+                        &fs,
+                        &FixedClock,
+                        Policy {
+                            confirm: crate::policy::ConfirmState::Confirmed,
+                            min_age: Duration::ZERO,
+                            ..Policy::default()
+                        },
+                    )
+                    .unwrap();
+                    let mut root = engine.root_task(fs.root_handle(), "/");
+                    let mut directory = engine.step(&mut root).child.unwrap();
+                    let step = engine.step(&mut directory);
+                    assert!(cancel.is_canceled());
+                    assert_eq!(step.status, StepStatus::Continue);
+                    drop(directory);
+                    drop(root);
+                    (
+                        step.delta,
+                        step.error.into_iter().chain(step.restore_error).collect(),
+                        engine.pending_references(),
+                    )
+                };
+                let after = fs.basic_info(&dir).unwrap().attributes;
+                let stats = fs.stats();
+                println!(
+                    "archive cancel permits={permits:?}: before={before:#x} after={after:#x} clears={} restores={} pending={pending}",
+                    stats.clear_readonly_calls, stats.restore_readonly_calls
+                );
+                assert_eq!(counters.dirs_removed, 0);
+                assert_eq!(counters.failed, 0);
+                assert!(errors.is_empty());
+                assert_eq!(pending, 0);
+                let root = fs.root_handle();
+                assert_eq!(fs.enumerate(&root).unwrap().len(), 1);
+                fs.close(root);
+                assert_eq!(stats.disposition_calls, 2);
+                assert_eq!(stats.clear_readonly_calls, 1);
+                fs.close(dir);
+                (permits, before, after, stats.restore_readonly_calls)
+            }));
+        }
+        for (permits, before, after, restores) in observations {
+            assert_eq!(after, before, "permits={permits:?}");
+            assert_eq!(restores, 1, "permits={permits:?}");
+        }
+    }
+
+    #[test]
     fn sched_pre_canceled_never_enumerates_or_disposes() {
         bounded(|| {
             let fs = FakeFs::new();

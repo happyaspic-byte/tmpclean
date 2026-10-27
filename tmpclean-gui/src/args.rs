@@ -24,32 +24,26 @@ impl From<TargetArg> for Target {
     }
 }
 
-/// Fast, safe Windows temp folder cleaner (window).
 #[derive(Debug, Parser)]
-#[command(name = "tmpclean-gui", version = tmpclean_core::VERSION)]
+#[command(name = "tmpclean-gui", version = tmpclean_core::VERSION, about = strings::GUI_ABOUT)]
 pub struct Cli {
-    /// Comma-separated targets to clean.
     #[arg(
         long,
+        help = strings::GUI_HELP_TARGETS,
         value_enum,
         value_delimiter = ',',
         default_value = "user-temp,inet-cache"
     )]
     pub targets: Vec<TargetArg>,
-    /// Count what would be removed without deleting anything.
-    #[arg(long)]
+    #[arg(long, help = strings::GUI_HELP_DRY_RUN)]
     pub dry_run: bool,
-    /// Start immediately, without the 5 s countdown.
-    #[arg(long)]
+    #[arg(long, help = strings::GUI_HELP_YES)]
     pub yes: bool,
-    /// Skip files modified more recently than this (e.g. 90s, 30m, 24h, 7d; 0 disables).
-    #[arg(long, default_value = "24h", value_parser = parse_min_age)]
+    #[arg(long, help = strings::GUI_HELP_MIN_AGE, default_value = "24h", value_parser = parse_min_age)]
     pub min_age: Duration,
-    /// Accepted for CLI parity; the window shows the summary instead.
-    #[arg(long)]
+    #[arg(long, help = strings::GUI_HELP_JSON)]
     pub json: bool,
-    /// Per-device I/O permits override.
-    #[arg(long, env = "TMPCLEAN_IO_PERMITS")]
+    #[arg(long, help = strings::GUI_HELP_IO_PERMITS, env = "TMPCLEAN_IO_PERMITS")]
     pub io_permits: Option<NonZeroUsize>,
 }
 
@@ -97,6 +91,27 @@ pub fn parse_min_age(s: &str) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn gui_args_help_uses_strings_table() {
+        let command = Cli::command();
+        assert_eq!(command.get_about().unwrap().to_string(), strings::GUI_ABOUT);
+        for (id, help) in [
+            ("targets", strings::GUI_HELP_TARGETS),
+            ("dry_run", strings::GUI_HELP_DRY_RUN),
+            ("yes", strings::GUI_HELP_YES),
+            ("min_age", strings::GUI_HELP_MIN_AGE),
+            ("json", strings::GUI_HELP_JSON),
+            ("io_permits", strings::GUI_HELP_IO_PERMITS),
+        ] {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .unwrap();
+            assert_eq!(arg.get_help().unwrap().to_string(), help);
+        }
+    }
 
     #[test]
     fn gui_args_defaults_match_cli_contract() {
