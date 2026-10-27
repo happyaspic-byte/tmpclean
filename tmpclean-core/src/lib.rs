@@ -5,6 +5,7 @@ pub mod win;
 
 pub mod engine;
 pub mod fs;
+pub mod resolve;
 
 /// Crate version, exposed for the binaries.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
