@@ -102,9 +102,15 @@ fn resolve_child_env() {
     match expected.as_str() {
         "resolved" => {
             let path = check_resolved(result);
-            assert!(path.eq_ignore_ascii_case(&normalize_path(
-                &std::env::var("TMPCLEAN_RESOLVE_PATH").unwrap()
-            )));
+            // The runner's TEMP can use an 8.3 spelling. Compare with the actual
+            // fixture's canonical path, not that input spelling.
+            let fixture =
+                fs::canonicalize(std::env::var_os("TMPCLEAN_RESOLVE_PATH").unwrap()).unwrap();
+            let expected = normalize_path(fixture.to_str().unwrap());
+            assert!(
+                path.eq_ignore_ascii_case(&expected),
+                "resolved {path:?}, canonical fixture {expected:?}"
+            );
         }
         "absent" => assert!(matches!(result, Resolution::Absent)),
         reason => assert!(matches!(result, Resolution::Refused(actual) if actual == reason)),
