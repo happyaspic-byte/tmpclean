@@ -39,6 +39,8 @@ pub const OUTCOME_COMPLETED: &str = "completed";
 pub const OUTCOME_COMPLETED_NOT_EMPTY: &str = "completed (not fully empty)";
 pub const OUTCOME_CANCELED: &str = "canceled";
 pub const OUTCOME_FAILED_TO_ENUMERATE: &str = "failed to enumerate";
+/// JSON outcome of a CLI run refused before it started (machine token).
+pub const OUTCOME_REFUSED: &str = "refused";
 
 // Resolve status names (also used in --json targets[].status).
 pub const STATUS_RESOLVED: &str = "resolved";

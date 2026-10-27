@@ -173,6 +173,97 @@ fn piped_stdin_without_yes_refuses_and_keeps_fixture() {
     assert!(fixture.intact());
 }
 
+fn target<'a>(report: &'a Value, name: &str) -> &'a Value {
+    report["targets"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing targets: {report}"))
+        .iter()
+        .find(|t| t["name"] == name)
+        .unwrap_or_else(|| panic!("missing target {name}: {report}"))
+}
+
+#[test]
+fn piped_stdin_json_without_yes_emits_refusal_report() {
+    let fixture = Fixture::new("noconfirm-json");
+    let output = fixture
+        .command()
+        .arg("--json")
+        .write_stdin("y\n")
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 3, "{output:?}");
+    let report = json(&output);
+    assert_eq!(report["schema"], 1, "{report}");
+    assert_eq!(report["exit_code"], 3, "{report}");
+    assert_eq!(report["outcome"], "refused", "{report}");
+    assert_eq!(report["dry_run"], false);
+    assert_eq!(target(&report, "user-temp")["status"], "resolved");
+    let counters = report["counters"].as_object().unwrap();
+    assert_eq!(counters.len(), 10, "{report}");
+    assert!(counters.values().all(|c| c == 0), "{report}");
+    assert_eq!(report["errors"], serde_json::json!([]));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("confirmation required; pass --yes"));
+    assert!(fixture.intact());
+}
+
+/// Deterministic mixed run: only `user-temp` is redirectable (TMP/TEMP), so
+/// it is made the refused target by pointing it at a real directory whose
+/// name is not on the allow-list (`name-not-allowed`); `windows-temp`
+/// resolves on the elevated CI runner. `--dry-run` keeps the real
+/// Windows\Temp untouched while the scheduler still processes it. Before the
+/// fix the resolved root made this exit 0.
+#[test]
+fn mixed_refused_and_resolved_targets_exit_3() {
+    let fixture = Fixture::new("mixed");
+    let refused = fixture.base.join("NotTemp");
+    fs::create_dir_all(&refused).unwrap();
+    let keep = refused.join("keep.txt");
+    fs::write(&keep, b"keep").unwrap();
+    let output = Command::cargo_bin("tmpclean")
+        .unwrap()
+        .env("TMP", &refused)
+        .env("TEMP", &refused)
+        .env_remove("TMPCLEAN_IO_PERMITS")
+        .args([
+            "--targets",
+            "user-temp,windows-temp",
+            "--min-age",
+            "0",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 3, "{output:?}");
+    let report = json(&output);
+    assert_eq!(report["schema"], 1);
+    assert_eq!(report["exit_code"], 3, "{report}");
+    assert_eq!(report["dry_run"], true);
+    assert_eq!(report["targets"].as_array().unwrap().len(), 2, "{report}");
+    assert_eq!(
+        target(&report, "user-temp")["status"],
+        "refused",
+        "{report}"
+    );
+    let windows_temp = target(&report, "windows-temp");
+    assert_eq!(windows_temp["status"], "resolved", "{report}");
+    assert!(windows_temp["path"]
+        .as_str()
+        .unwrap()
+        .to_ascii_lowercase()
+        .ends_with("\\temp"));
+    // The runnable target was processed (the scheduler ran to an outcome).
+    assert!(
+        report["outcome"]
+            .as_str()
+            .is_some_and(|o| o.starts_with("completed")),
+        "{report}"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("user-temp: refused"));
+    assert!(keep.is_file(), "the refused target is never touched");
+    assert!(fixture.intact());
+}
+
 #[test]
 fn yes_empties_fixture_and_keeps_root() {
     let fixture = Fixture::new("yes");

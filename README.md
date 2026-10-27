@@ -38,7 +38,7 @@ tmpclean --targets user-temp,inet-cache,windows-temp --yes   # include Windows\T
 | `--targets LIST` | `user-temp,inet-cache` | Comma-separated targets. `user-temp` = your `%TEMP%` (via `GetTempPath2W`, falling back to `GetTempPathW`); `inet-cache` = the Internet cache known folder; `windows-temp` = `%SystemRoot%\Temp` (opt-in only, usually needs an elevated prompt). An unknown name is a usage error (exit 2). |
 | `--dry-run` | off | Enumerate and count what would be deleted; delete nothing. Needs no confirmation. |
 | `--yes` | off | Confirm deletion without prompting. Required when stdin is not a terminal. |
-| `--min-age DUR` | `24h` | Skip files and links changed more recently than `DUR` (newest of creation, last-write and change time). `DUR` is `0` (disables the filter) or a whole number with `s`, `m`, `h` or `d` (e.g. `90s`, `30m`, `7d`). Directories are never age-filtered. |
+| `--min-age DUR` | `24h` | Skip files and links changed more recently than `DUR` (newest of creation, last-write and change time). `DUR` is `0` (disables the filter) or a whole number with `s`, `m`, `h` or `d` (e.g. `90s`, `30m`, `7d`); anything else (`5`, `1.5h`, `1w`, `-1h`) is a usage error (exit 2). Directories are never age-filtered. |
 | `--json` | off | Print only the JSON report (schema v1, below) to stdout. |
 | `--io-permits N` | per device | Override the number of concurrent deletions per physical device (positive integer; env `TMPCLEAN_IO_PERMITS`, the flag wins). Default: 1 for spinning disks, 4 for SSDs, 2 if unknown. |
 | `--help`, `--version` | | Standard. |
@@ -46,7 +46,14 @@ tmpclean --targets user-temp,inet-cache,windows-temp --yes   # include Windows\T
 Confirmation: without `--yes` (and without `--dry-run`) the CLI prints the
 targets and asks `[y/N]` when stdin is a terminal, and refuses with exit 3
 otherwise, so a scheduled task never hangs on a prompt (a piped `y` does
-not count). The GUI shows a 5-second countdown you can cancel.
+not count). The GUI shows a 5-second countdown you can cancel. With
+`--json`, a refused or declined confirmation still prints one schema-v1
+report: `outcome` is `refused`, `exit_code` is 3, every target is listed
+with its status, and all counters are 0.
+
+Targets are independent: a refused or requires-elevation target does not
+stop the others from running, but it makes the whole run exit 3 (also with
+`--dry-run`), and the JSON report lists every target's status.
 
 Output: in text mode, throttled progress lines go to stderr and the final
 summary (ending with "Logical bytes removed") to stdout; with `--dry-run` the
@@ -66,7 +73,7 @@ and counted, not retried.
 | 0 | Completed with no failures - including entries excluded by `--min-age`, entries skipped because they are in use, targets that do not exist, and every `--dry-run` whose targets resolved. |
 | 1 | Completed, but at least one entry failed to delete (`failed > 0`), or a root could not be enumerated. |
 | 2 | Usage error (bad flag or unknown target name). |
-| 3 | Refused: a target root failed the safety guard, the target requires elevation, confirmation was required/declined, or the run was canceled. |
+| 3 | Refused: any selected target root failed the safety guard or requires elevation (even if the other targets ran), confirmation was required/declined, or the run was canceled. |
 
 ## JSON report (schema v1)
 
@@ -100,7 +107,8 @@ and counted, not retried.
 }
 ```
 
-- `outcome`: `completed`, `completed (not fully empty)`, `canceled`, `failed to enumerate`.
+- `outcome`: `completed`, `completed (not fully empty)`, `canceled`, `failed to enumerate`,
+  or `refused` (confirmation required/declined; nothing ran).
 - `targets[].status`: `resolved`, `absent`, `requires-elevation`, `refused`, `unknown-target`.
 - `counters`: `excluded` = skipped by `--min-age`; `skipped_in_use` = sharing/lock
   violations; `failed` = every other error; `absent` = vanished before deletion;

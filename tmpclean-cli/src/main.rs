@@ -2,6 +2,8 @@
 mod app;
 #[cfg(any(windows, test))]
 mod args;
+#[cfg(any(windows, test))]
+mod status;
 
 use std::process::ExitCode;
 
