@@ -20,6 +20,12 @@ pub const GUI_EXIT_CODE: &str = "exit code";
 pub const GUI_DRY_RUN_NOTE: &str = "Dry run: counters are would-remove totals.";
 pub const GUI_WINDOW_FAILED: &str = "Unable to create the tmpclean window.";
 pub const GUI_WINDOWS_ONLY: &str = "tmpclean-gui runs only on Windows.";
+// GUI `--min-age` validation, shown in the usage message box; the quoted
+// input goes between prefix and suffix.
+pub const GUI_ARG_DURATION_INVALID_PREFIX: &str = "invalid duration ";
+pub const GUI_ARG_DURATION_INVALID_SUFFIX: &str = ": expected e.g. 0, 90s, 30m, 24h, 7d";
+pub const GUI_ARG_DURATION_TOO_LARGE_PREFIX: &str = "duration ";
+pub const GUI_ARG_DURATION_TOO_LARGE_SUFFIX: &str = " is too large";
 
 // Report / summary labels.
 pub const LABEL_OUTCOME: &str = "Outcome";

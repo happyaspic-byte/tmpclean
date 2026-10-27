@@ -1,10 +1,11 @@
 # Real-surface QA for tmpclean-gui.exe via UI Automation (windows-latest CI).
-# Every wait is bounded and polls at a 250 ms tick; no long fixed sleeps.
+# Every wait is bounded and event-driven (UI Automation events or process
+# exit wake a wait handle); there are no sleeps or sleeping polls.
 # Windows PowerShell 5.1 compatible. Exits non-zero on any failed assertion.
 param([string]$Exe = 'target\release\tmpclean-gui.exe')
 
 $ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Drawing, System.Windows.Forms
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, WindowsBase, System.Drawing, System.Windows.Forms
 
 $Exe = (Resolve-Path -LiteralPath $Exe).Path
 $fixture = Join-Path $env:RUNNER_TEMP 'gui\Temp'
@@ -23,6 +24,53 @@ Add-Type -Namespace E2E -Name Native -MemberDefinition @'
 [System.Runtime.InteropServices.DllImport("user32.dll")]
 public static extern System.IntPtr SendMessageW(System.IntPtr hwnd, uint msg, System.IntPtr w, System.IntPtr l);
 '@
+
+# Bounded event-driven wait. UIA handlers run on UIA threads, so they live in
+# C# and only signal; `done` is re-evaluated on the calling (PowerShell) thread
+# after subscribing (no lost wake-up), then after each event, until it holds,
+# the process exits, or the deadline passes.
+Add-Type -ReferencedAssemblies @(
+    [System.Windows.Automation.AutomationElement].Assembly.Location,
+    [System.Windows.Automation.TreeScope].Assembly.Location,
+    [System.Windows.Rect].Assembly.Location
+) -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.Threading;
+using System.Windows.Automation;
+using Microsoft.Win32.SafeHandles;
+
+namespace E2E {
+    public static class UiaWait {
+        public static bool Until(AutomationElement scope, TreeScope ts, Func<bool> done, IntPtr process, int ms) {
+            var changed = new AutoResetEvent(false);
+            var exited = new ManualResetEvent(false);
+            exited.SafeWaitHandle = new SafeWaitHandle(process, false);
+            AutomationPropertyChangedEventHandler ph = (s, e) => changed.Set();
+            StructureChangedEventHandler sh = (s, e) => changed.Set();
+            AutomationEventHandler oh = (s, e) => changed.Set();
+            Automation.AddAutomationPropertyChangedEventHandler(scope, ts, ph,
+                AutomationElement.NameProperty, AutomationElement.IsEnabledProperty);
+            Automation.AddStructureChangedEventHandler(scope, ts, sh);
+            Automation.AddAutomationEventHandler(WindowPattern.WindowOpenedEvent, scope, ts, oh);
+            try {
+                var sw = Stopwatch.StartNew();
+                while (true) {
+                    if (done()) return true;
+                    long left = ms - sw.ElapsedMilliseconds;
+                    if (left <= 0) return false;
+                    if (WaitHandle.WaitAny(new WaitHandle[] { changed, exited }, (int)left) == 1) return done();
+                }
+            } finally {
+                Automation.RemoveAutomationPropertyChangedEventHandler(scope, ph);
+                Automation.RemoveStructureChangedEventHandler(scope, sh);
+                Automation.RemoveAutomationEventHandler(WindowPattern.WindowOpenedEvent, scope, oh);
+            }
+        }
+    }
+}
+'@
+$TS = [System.Windows.Automation.TreeScope]
 
 function Check($cond, [string]$msg) {
     if (-not $cond) { throw "ASSERT FAIL: $msg" }
@@ -46,33 +94,30 @@ function Launch([string]$arguments) {
     $psi.EnvironmentVariables['TEMP'] = $fixture
     $p = [System.Diagnostics.Process]::Start($psi)
     $script:procs += $p
+    $script:current = $p
     Write-Host "launched pid $($p.Id): tmpclean-gui.exe $arguments"
     $p
 }
 
-# Bounded 30 s: WaitForInputIdle, then poll the process main window handle.
+# Bounded 30 s: WaitForInputIdle, then wait for a top-level window-opened or
+# structure event until the process has a main window handle.
 function Wait-Window($p) {
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try { [void]$p.WaitForInputIdle(30000) } catch { }
-    while ($sw.Elapsed.TotalSeconds -lt 30) {
-        $p.Refresh()
+    $ready = [Func[bool]]({ $p.Refresh(); $p.MainWindowHandle -ne [IntPtr]::Zero })
+    if (-not [E2E.UiaWait]::Until($AE::RootElement, $TS::Children, $ready, $p.Handle, 30000)) {
         if ($p.HasExited) { throw "process exited early with code $($p.ExitCode)" }
-        if ($p.MainWindowHandle -ne [IntPtr]::Zero) {
-            return $AE::FromHandle($p.MainWindowHandle)
-        }
-        Start-Sleep -Milliseconds 250
+        throw 'timeout (30 s) waiting for the main window'
     }
-    throw 'timeout (30 s) waiting for the main window'
+    if ($p.HasExited) { throw "process exited early with code $($p.ExitCode)" }
+    $AE::FromHandle($p.MainWindowHandle)
 }
 
+# Bounded 10 s: the control is found now or after a structure-changed event.
 function Find-Child($win, [string]$automationId) {
     $cond = New-Object System.Windows.Automation.PropertyCondition($AE::AutomationIdProperty, $automationId)
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    while ($sw.Elapsed.TotalSeconds -lt 10) {
-        $el = $win.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
-        if ($el) { return $el }
-        Start-Sleep -Milliseconds 250
-    }
+    $hit = @{}
+    $found = [Func[bool]]({ $hit.el = $win.FindFirst($TS::Descendants, $cond); $null -ne $hit.el })
+    if ([E2E.UiaWait]::Until($win, $TS::Subtree, $found, $script:current.Handle, 10000)) { return $hit.el }
     throw "control with AutomationId $automationId not found"
 }
 
@@ -119,12 +164,11 @@ try {
     $close = Find-Child $win '102'
     Check ($close.Current.Name -eq 'Close') "Close button (IDC_CLOSE=102) accessible name is 'Close'"
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    while (-not ($win.Current.Name -eq 'tmpclean - done' -and $close.Current.IsEnabled)) {
+    # Bounded 120 s: re-checked on title (Name) / IsEnabled change events.
+    $done = [Func[bool]]({ $win.Current.Name -eq 'tmpclean - done' -and $close.Current.IsEnabled })
+    if (-not [E2E.UiaWait]::Until($win, $TS::Subtree, $done, $p.Handle, 120000)) {
         if ($p.HasExited) { throw "GUI exited before completion with code $($p.ExitCode)" }
-        if ($sw.Elapsed.TotalSeconds -ge 120) {
-            throw "timeout (120 s): title '$($win.Current.Name)', Close IsEnabled=$($close.Current.IsEnabled)"
-        }
-        Start-Sleep -Milliseconds 250
+        throw "timeout (120 s): title '$($win.Current.Name)', Close IsEnabled=$($close.Current.IsEnabled)"
     }
     Check ($win.Current.Name -eq 'tmpclean - done') "title is 'tmpclean - done' after $([int]$sw.Elapsed.TotalMilliseconds) ms"
     Check ($close.Current.IsEnabled) 'Close IsEnabled == true at completion'
