@@ -121,6 +121,46 @@ impl Outcome {
     }
 }
 
+/// Windows error codes with dedicated counters.
+pub const ERROR_FILE_NOT_FOUND: u32 = 2;
+pub const ERROR_PATH_NOT_FOUND: u32 = 3;
+pub const ERROR_SHARING_VIOLATION: u32 = 32;
+pub const ERROR_LOCK_VIOLATION: u32 = 33;
+
+impl Counters {
+    /// Classify a per-path error: increments the matching counter and
+    /// returns the machine-readable disposition for its [`ErrorRecord`].
+    /// A file that vanished mid-scan counts as `absent`, never `failed`
+    /// and never `files_removed`.
+    pub fn classify(&mut self, code: u32) -> &'static str {
+        match code {
+            ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => {
+                self.absent += 1;
+                "absent"
+            }
+            ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION => {
+                self.skipped_in_use += 1;
+                "skipped_in_use"
+            }
+            _ => {
+                self.failed += 1;
+                "failed"
+            }
+        }
+    }
+
+    /// Record a per-path error: classify it into the counters and build
+    /// its [`ErrorRecord`].
+    pub fn record_error(&mut self, path: impl Into<String>, code: u32) -> ErrorRecord {
+        let disposition = self.classify(code);
+        ErrorRecord {
+            path: path.into(),
+            code,
+            disposition: disposition.into(),
+        }
+    }
+}
+
 /// Exit codes (locked table):
 /// 0 = completed (incl. policy exclusions and in-use skips), every resolved
 ///     dry-run, and targets that turned out already absent;
@@ -139,11 +179,16 @@ pub fn exit_code(
         ResolveStatus::Refused | ResolveStatus::RequiresElevation => return 3,
         _ => {}
     }
+    // Locked table: EVERY --dry-run whose target resolved exits 0,
+    // regardless of outcome or recorded failures.
+    if dry_run {
+        return 0;
+    }
     match outcome {
         Outcome::Canceled => 3,
         Outcome::FailedToEnumerate => 1,
         Outcome::Completed { .. } => {
-            if dry_run || counters.failed == 0 {
+            if counters.failed == 0 {
                 0
             } else {
                 1
@@ -262,7 +307,10 @@ pub fn to_json(report: &Report) -> String {
         c.logical_bytes_removed
     ));
     s.push_str("},\"errors\":[");
-    for (i, e) in report.errors.iter().enumerate() {
+    // Enforce the 1000-error output bound for ANY Report, not only ones
+    // built through Report::new.
+    let truncated = report.errors_truncated || report.errors.len() > MAX_ERRORS;
+    for (i, e) in report.errors.iter().take(MAX_ERRORS).enumerate() {
         if i > 0 {
             s.push(',');
         }
@@ -275,11 +323,7 @@ pub fn to_json(report: &Report) -> String {
         s.push('}');
     }
     s.push_str("],\"errors_truncated\":");
-    s.push_str(if report.errors_truncated {
-        "true"
-    } else {
-        "false"
-    });
+    s.push_str(if truncated { "true" } else { "false" });
     s.push('}');
     s
 }
@@ -544,6 +588,43 @@ mod tests {
     }
 
     #[test]
+    fn exit_dry_run_resolved_is_0_for_every_outcome() {
+        // Locked table: EVERY resolved --dry-run exits 0, whatever the
+        // outcome or failure count.
+        let c = counters_with_failed(9);
+        for outcome in [
+            Outcome::Completed { fully_empty: true },
+            Outcome::Completed { fully_empty: false },
+            Outcome::Canceled,
+            Outcome::FailedToEnumerate,
+        ] {
+            assert_eq!(exit_code(outcome, &c, ResolveStatus::Resolved, true), 0);
+            assert_eq!(exit_code(outcome, &c, ResolveStatus::Absent, true), 0);
+        }
+    }
+
+    #[test]
+    fn exit_dry_run_does_not_mask_resolve_failures() {
+        // Resolution failures still win over the dry-run rule.
+        let c = Counters::default();
+        assert_eq!(
+            exit_code(
+                Outcome::Completed { fully_empty: true },
+                &c,
+                ResolveStatus::UnknownTarget,
+                true
+            ),
+            2
+        );
+        for rs in [ResolveStatus::Refused, ResolveStatus::RequiresElevation] {
+            assert_eq!(
+                exit_code(Outcome::Completed { fully_empty: true }, &c, rs, true),
+                3
+            );
+        }
+    }
+
+    #[test]
     fn exit_failed_to_enumerate_is_1() {
         assert_eq!(
             exit_code(
@@ -636,6 +717,31 @@ mod tests {
     }
 
     #[test]
+    fn to_json_caps_errors_for_any_report() {
+        // The serializer itself enforces the bound, even for a Report
+        // constructed directly via public fields with 1500 errors and a
+        // false errors_truncated flag.
+        let r = Report {
+            outcome: Outcome::Completed { fully_empty: false },
+            exit_code: 1,
+            targets: vec![],
+            counters: counters_with_failed(1500),
+            errors: (0..1500)
+                .map(|i| ErrorRecord {
+                    path: format!("p{i}"),
+                    code: 5,
+                    disposition: "failed".into(),
+                })
+                .collect(),
+            errors_truncated: false,
+            dry_run: false,
+        };
+        let v: serde_json::Value = serde_json::from_str(&to_json(&r)).unwrap();
+        assert_eq!(v["errors"].as_array().unwrap().len(), 1000);
+        assert_eq!(v["errors_truncated"], true);
+    }
+
+    #[test]
     fn json_written_for_evidence() {
         // Used by the harness jq check; writes via TMPCL_TEST_JSON_OUT.
         if let Ok(p) = std::env::var("TMPCL_TEST_JSON_OUT") {
@@ -711,59 +817,48 @@ mod tests {
         assert_eq!(agg.drain().counters.files_removed, 3);
     }
 
-    // ---- absent vs removed ----
-
-    const FILE_NOT_FOUND: u32 = 2;
-    const SHARING_VIOLATION: u32 = 32;
-
-    fn apply_worker_error(c: &mut Counters, code: u32) -> ErrorRecord {
-        match code {
-            FILE_NOT_FOUND => {
-                c.absent += 1;
-                ErrorRecord {
-                    path: "x".into(),
-                    code,
-                    disposition: "absent".into(),
-                }
-            }
-            SHARING_VIOLATION => {
-                c.skipped_in_use += 1;
-                ErrorRecord {
-                    path: "x".into(),
-                    code,
-                    disposition: "skipped_in_use".into(),
-                }
-            }
-            other => {
-                c.failed += 1;
-                ErrorRecord {
-                    path: "x".into(),
-                    code: other,
-                    disposition: "failed".into(),
-                }
-            }
-        }
-    }
+    // ---- absent vs removed (shipped Counters::record_error/classify) ----
 
     #[test]
     fn file_not_found_counts_absent_not_removed() {
         let mut c = Counters::default();
-        let rec = apply_worker_error(&mut c, FILE_NOT_FOUND);
+        let rec = c.record_error("x", ERROR_FILE_NOT_FOUND);
         assert_eq!(c.absent, 1);
         assert_eq!(
             c.files_removed, 0,
             "FILE_NOT_FOUND must not count as removed"
         );
         assert_eq!(rec.disposition, "absent");
+        // PATH_NOT_FOUND is the same class.
+        let rec2 = c.record_error("y", ERROR_PATH_NOT_FOUND);
+        assert_eq!(c.absent, 2);
+        assert_eq!(c.files_removed, 0);
+        assert_eq!(rec2.disposition, "absent");
     }
 
     #[test]
     fn sharing_violation_counts_skipped_in_use() {
         let mut c = Counters::default();
-        let rec = apply_worker_error(&mut c, SHARING_VIOLATION);
+        let rec = c.record_error("x", ERROR_SHARING_VIOLATION);
         assert_eq!(c.skipped_in_use, 1);
         assert_eq!(c.files_removed, 0);
         assert_eq!(rec.disposition, "skipped_in_use");
+        let rec2 = c.record_error("y", ERROR_LOCK_VIOLATION);
+        assert_eq!(c.skipped_in_use, 2);
+        assert_eq!(rec2.disposition, "skipped_in_use");
+    }
+
+    #[test]
+    fn access_denied_counts_failed() {
+        const ERROR_ACCESS_DENIED: u32 = 5;
+        let mut c = Counters::default();
+        let rec = c.record_error("x", ERROR_ACCESS_DENIED);
+        assert_eq!(c.failed, 1);
+        assert_eq!(c.absent, 0);
+        assert_eq!(c.skipped_in_use, 0);
+        assert_eq!(c.files_removed, 0);
+        assert_eq!(rec.disposition, "failed");
+        assert_eq!(rec.code, ERROR_ACCESS_DENIED);
     }
 
     // ---- format_lines ----
