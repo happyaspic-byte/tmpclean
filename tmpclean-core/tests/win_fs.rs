@@ -489,9 +489,11 @@ fn delete_denied_readonly_file_stays_readonly_after_failed_delete() {
     assert_eq!(before & (READONLY | 0x20), READONLY | 0x20);
 
     // FILE_DELETE_CHILD on the parent would otherwise override the file's
-    // DELETE deny, so deny both; the guard drops before the fixture.
+    // DELETE deny, so deny both; the guard drops before the fixture. Use the
+    // specific right (DE): the simple right (D) also denies SYNCHRONIZE, which
+    // would block the attribute-only handle opened below.
     let _guard = DenyGuard(vec![path.clone(), dir.0.clone()]);
-    icacls(&path, &["/deny", "*S-1-1-0:(D)"]).unwrap();
+    icacls(&path, &["/deny", "*S-1-1-0:(DE)"]).unwrap();
     icacls(&dir.0, &["/deny", "*S-1-1-0:(DC)"]).unwrap();
 
     // Engine over the real filesystem: the delete fails, the file is retained
@@ -522,7 +524,7 @@ fn delete_denied_readonly_file_stays_readonly_after_failed_delete() {
     );
     let file = fs
         .open_child_no_follow(&root, OsStr::new("denied.txt"), Access::READ)
-        .unwrap();
+        .expect("attribute-only open must survive a DELETE-only deny");
     fs.clear_readonly(&file).unwrap();
     assert_eq!(fs.basic_info(&file).unwrap().attributes & READONLY, 0);
     assert_eq!(
