@@ -133,20 +133,27 @@ try {
     $locked = Join-Path $root 'lockdir\locked.bin'
     [void][IO.Directory]::CreateDirectory((Split-Path $locked))
     Set-Content -LiteralPath $locked -Value 'locked'
-    $ready = Join-Path $base 'lock-ready'
-    $job = Start-Job -ArgumentList $locked, $ready -ScriptBlock {
-        param($path, $readyPath)
+    # Named events (no sleeps): the job signals 'ready' once the handle is
+    # open, then blocks on 'release' (bounded) and closes the handle.
+    $tag = [guid]::NewGuid().ToString('N')
+    $readyName = "Local\tmpclean-e2e-ready-$tag"
+    $releaseName = "Local\tmpclean-e2e-release-$tag"
+    $readyEvent = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, $readyName)
+    $releaseEvent = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, $releaseName)
+    $job = Start-Job -ArgumentList $locked, $readyName, $releaseName -ScriptBlock {
+        param($path, $readyName, $releaseName)
+        $release = [Threading.EventWaitHandle]::OpenExisting($releaseName)
         $stream = [IO.File]::Open($path, 'Open', 'Read', 'None')
-        Set-Content -LiteralPath $readyPath -Value 'ready'
-        # Hold the handle until the job is stopped.
-        while ($true) { Start-Sleep -Seconds 1 }
-        $stream.Dispose()
+        try {
+            [void][Threading.EventWaitHandle]::OpenExisting($readyName).Set()
+            # Hold the handle until released (bounded at 30 min).
+            [void]$release.WaitOne([TimeSpan]::FromMinutes(30))
+        } finally {
+            $stream.Dispose()
+        }
     }
-    $deadline = [DateTime]::UtcNow.AddSeconds(60)
-    while (-not (Test-Path -LiteralPath $ready)) {
-        if ($job.State -ne 'Running') { throw "lock job ended early: $(Receive-Job $job 2>&1)" }
-        if ([DateTime]::UtcNow -gt $deadline) { throw 'lock job did not signal ready within 60 s' }
-        Start-Sleep -Milliseconds 100
+    if (-not $readyEvent.WaitOne([TimeSpan]::FromSeconds(60))) {
+        throw "lock job did not signal ready within 60 s (state $($job.State)): $(Receive-Job $job 2>&1)"
     }
     $lockHeld = $false
     try { [IO.File]::Open($locked, 'Open', 'Read', 'ReadWrite').Dispose() } catch [IO.IOException] { $lockHeld = $true }
@@ -177,7 +184,8 @@ try {
         Assert-That (-not (Test-Path -LiteralPath $locked)) 'NEGATIVE CONTROL: locked file gone (must FAIL)'
     }
 
-    Stop-Job $job
+    [void]$releaseEvent.Set()
+    Assert-That ($null -ne (Wait-Job $job -Timeout 60)) 'lock job released the handle within 60 s'
     Remove-Job $job -Force
     $job = $null
 

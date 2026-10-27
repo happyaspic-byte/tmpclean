@@ -62,3 +62,23 @@ pub const DRY_RUN_NOTE: &str =
 pub const LABEL_PROGRESS: &str = "Progress";
 pub const MORE_ERRORS_IN_JSON: &str = "More errors occurred; run with --json for the full list.";
 pub const WINDOWS_ONLY: &str = "Windows only";
+pub const CTRL_C_UNAVAILABLE: &str = "warning: Ctrl+C handler unavailable";
+
+// CLI flag help (tmpclean --help).
+pub const CLI_ABOUT: &str = "Fast, safe Windows temp folder cleaner.";
+pub const CLI_HELP_TARGETS: &str = "Comma-separated targets to clean.";
+pub const CLI_HELP_DRY_RUN: &str = "Count what would be deleted; delete nothing.";
+pub const CLI_HELP_YES: &str =
+    "Confirm deletion without prompting (required when stdin is not a terminal).";
+pub const CLI_HELP_MIN_AGE: &str =
+    "Skip files and links changed more recently than DUR (e.g. 0, 90s, 30m, 24h, 7d).";
+pub const CLI_HELP_JSON: &str = "Print only the JSON report (schema v1) to stdout.";
+pub const CLI_HELP_IO_PERMITS: &str =
+    "Concurrent deletions per physical device (default: chosen per device).";
+pub const CLI_HELP_STATS: &str = "Print scheduler diagnostics to stderr after the run.";
+
+// --min-age validation (shown after the offending value).
+pub const DURATION_EMPTY: &str = "empty duration";
+pub const DURATION_EXPECTED: &str = "expected 0 or a number with s, m, h or d";
+pub const DURATION_NUMBER_TOO_LARGE: &str = "number too large";
+pub const DURATION_TOO_LARGE: &str = "duration too large";

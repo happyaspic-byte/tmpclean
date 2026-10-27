@@ -97,7 +97,7 @@ pub fn run() -> ExitCode {
         let cancel = CancelToken::new();
         let on_ctrl_c = cancel.clone();
         if let Err(error) = ctrlc::set_handler(move || on_ctrl_c.cancel()) {
-            eprintln!("warning: Ctrl+C handler unavailable: {error}");
+            eprintln!("{}: {error}", strings::CTRL_C_UNAVAILABLE);
         }
         let fs = WinFs::new();
         let json = cli.json;
