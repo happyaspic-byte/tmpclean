@@ -14,6 +14,11 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Ioctl",
     "Win32_System_Kernel",
     "Win32_System_SystemServices",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_WindowsProgramming",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
 ] }
 
 [dev-dependencies]
