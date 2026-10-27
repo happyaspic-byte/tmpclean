@@ -1,12 +1,23 @@
-use clap::Parser;
+#[cfg(windows)]
+mod app;
+#[cfg(any(windows, test))]
+mod args;
 
-/// Fast, safe Windows temp folder cleaner.
-#[derive(Parser)]
-#[command(name = "tmpclean", version = tmpclean_core::VERSION)]
-struct Cli {}
+use std::process::ExitCode;
 
-fn main() {
-    #[cfg(windows)]
+#[cfg(windows)]
+fn main() -> ExitCode {
+    // Restrict DLL search to System32 before anything else runs.
     tmpclean_core::win::harden();
-    let _cli = Cli::parse();
+    app::run()
+}
+
+#[cfg(not(windows))]
+fn main() -> ExitCode {
+    eprintln!(
+        "{}: {}",
+        tmpclean_core::strings::APP_NAME,
+        tmpclean_core::strings::WINDOWS_ONLY
+    );
+    ExitCode::from(2)
 }

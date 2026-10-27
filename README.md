@@ -38,15 +38,21 @@ tmpclean --targets user-temp,inet-cache,windows-temp --yes   # include Windows\T
 | `--targets LIST` | `user-temp,inet-cache` | Comma-separated targets. `user-temp` = your `%TEMP%` (via `GetTempPath2W`, falling back to `GetTempPathW`); `inet-cache` = the Internet cache known folder; `windows-temp` = `%SystemRoot%\Temp` (opt-in only, usually needs an elevated prompt). An unknown name is a usage error (exit 2). |
 | `--dry-run` | off | Enumerate and count what would be deleted; delete nothing. Needs no confirmation. |
 | `--yes` | off | Confirm deletion without prompting. Required when stdin is not a terminal. |
-| `--min-age DUR` | `24h` | Skip files and links changed more recently than `DUR` (newest of creation, last-write and change time). `0` disables the filter. Directories are never age-filtered. |
+| `--min-age DUR` | `24h` | Skip files and links changed more recently than `DUR` (newest of creation, last-write and change time). `DUR` is `0` (disables the filter) or a whole number with `s`, `m`, `h` or `d` (e.g. `90s`, `30m`, `7d`). Directories are never age-filtered. |
 | `--json` | off | Print only the JSON report (schema v1, below) to stdout. |
-| `--io-permits N` | per device | Override the number of concurrent deletions per physical device (env `TMPCLEAN_IO_PERMITS`). Default: 1 for spinning disks, 4 for SSDs, 2 if unknown. |
+| `--io-permits N` | per device | Override the number of concurrent deletions per physical device (positive integer; env `TMPCLEAN_IO_PERMITS`, the flag wins). Default: 1 for spinning disks, 4 for SSDs, 2 if unknown. |
 | `--help`, `--version` | | Standard. |
 
 Confirmation: without `--yes` (and without `--dry-run`) the CLI prints the
 targets and asks `[y/N]` when stdin is a terminal, and refuses with exit 3
-otherwise, so a scheduled task never hangs on a prompt. The GUI shows a
-5-second countdown you can cancel.
+otherwise, so a scheduled task never hangs on a prompt (a piped `y` does
+not count). The GUI shows a 5-second countdown you can cancel.
+
+Output: in text mode, throttled progress lines go to stderr and the final
+summary (ending with "Logical bytes removed") to stdout; with `--dry-run` the
+removal counts are would-remove totals. With `--json`, stdout carries only the
+JSON report. Ctrl+C cancels the run: in-flight deletions finish, nothing new
+starts, and the exit code is 3.
 
 Only the **contents** of each target are deleted; the temp folders themselves
 are kept. Junctions, symbolic links and mount points inside a target are

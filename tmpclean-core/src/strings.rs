@@ -34,3 +34,12 @@ pub const STATUS_UNKNOWN_TARGET: &str = "unknown-target";
 pub const CONFIRM_PROMPT: &str = "Proceed with deletion? [y/N]";
 pub const CONFIRM_DECLINED: &str = "Confirmation declined; nothing was deleted.";
 pub const CANCELED_BY_USER: &str = "Canceled by user.";
+
+// CLI surface.
+pub const CONFIRM_TARGETS: &str = "The contents of these folders will be deleted:";
+pub const CONFIRMATION_REQUIRED: &str = "confirmation required; pass --yes";
+pub const DRY_RUN_NOTE: &str =
+    "Dry run: nothing was deleted; removal counts are would-remove totals.";
+pub const LABEL_PROGRESS: &str = "Progress";
+pub const MORE_ERRORS_IN_JSON: &str = "More errors occurred; run with --json for the full list.";
+pub const WINDOWS_ONLY: &str = "Windows only";
