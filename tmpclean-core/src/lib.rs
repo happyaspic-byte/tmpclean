@@ -6,6 +6,9 @@ mod win;
 /// Crate version, exposed for the binaries.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod report;
+pub mod strings;
+
 #[cfg(test)]
 mod tests {
     use super::*;
