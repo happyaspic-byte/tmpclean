@@ -1,8 +1,8 @@
 //! Bounded work stealing over handle-anchored directory and 128-name tasks.
 //!
-//! Each worker keeps a depth-first ancestor stack. Only whole name batches enter
-//! bounded deques; owners pop the back and thieves take the front. A full queue
-//! is processed locally. Waiting ancestors hold no I/O permit. At quiescence,
+//! Each worker keeps a depth-first ancestor stack. Opened directories and whole
+//! name batches enter bounded deques; owners pop the back and thieves take the
+//! front. A full queue is processed locally. Waiting ancestors hold no I/O permit. At quiescence,
 //! each waiting ancestor has a queued/active descendant, so storage is bounded
 //! by worker traversal depth plus the queue, never the number of directory names.
 //! SATA and NVMe cannot be distinguished from seek-penalty information: both
@@ -335,7 +335,10 @@ fn drive<'a, F: FileSystem>(
                     }
                     state.outstanding += 1;
                     let work = Work { task, device };
-                    if work.task.is_batch() && state.queued < pool.capacity {
+                    // Publish opened subtrees as well as flat-directory batches.
+                    // Keeping a child directory local parks its siblings behind
+                    // the entire subtree, even when other workers are idle.
+                    if state.queued < pool.capacity {
                         state.queues[worker].push_back(work);
                         state.queued += 1;
                         state.peak = state.peak.max(state.queued);
@@ -504,6 +507,58 @@ mod tests {
             parallel_fs.max_concurrent_dispositions,
             parallel.counters
         );
+    }
+
+    #[test]
+    fn sched_sibling_subtrees_make_progress_concurrently() {
+        bounded(|| {
+            let fs = FakeFs::new();
+            // Each directory fits in one batch, as in the Windows benchmark.
+            for i in 0..25 {
+                let dir = format!("dir{i:02}");
+                fs.close(fs.add_dir(&dir).unwrap());
+                flat(&fs, &format!("{dir}/"), 40);
+            }
+            let width = 4.min(worker_ceiling());
+            let rendezvous = Arc::new((Mutex::new(0usize), Condvar::new()));
+            let calls = AtomicUsize::new(0);
+            fs.set_disposition_hook(Some(Arc::new(move || {
+                if calls.fetch_add(1, Ordering::SeqCst) < width {
+                    let (mutex, changed) = &*rendezvous;
+                    let mut arrived = mutex.lock().unwrap();
+                    *arrived += 1;
+                    changed.notify_all();
+                    // A timeout makes the final concurrency assertion fail,
+                    // rather than panicking inside a scheduler worker.
+                    let _ = changed
+                        .wait_timeout_while(arrived, Duration::from_secs(2), |arrived| {
+                            *arrived < width
+                        })
+                        .unwrap();
+                }
+            })));
+            let mut scheduler = scheduler(&fs, NonZeroUsize::new(4));
+            let result = scheduler.run(
+                vec![Root {
+                    handle: fs.root_handle(),
+                    path: "/".into(),
+                }],
+                &CancelToken::new(),
+                |_| {},
+            );
+            fs.set_disposition_hook(None);
+            assert_eq!(result.counters.files_removed, 1000);
+            assert_eq!(result.counters.dirs_removed, 25);
+            assert_eq!(result.counters.logical_bytes_removed, 3000);
+            assert_eq!(result.counters.failed, 0);
+            assert_eq!(result.outcome, Outcome::Completed { fully_empty: true });
+            assert_eq!(scheduler.stats().pending_references, 0);
+            assert!(
+                fs.stats().max_concurrent_dispositions > 1,
+                "sibling subtrees must be stealable, not only their name batches"
+            );
+            assert!(fs.stats().max_concurrent_dispositions <= 4);
+        });
     }
 
     #[test]
